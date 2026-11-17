@@ -1,0 +1,37 @@
+name: Harness CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  harness-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install prototype checker dependency
+        run: npm --prefix harness/guards install --no-audit --no-fund
+
+      - name: Run secret scan
+        run: python3 harness/guards/check_secrets.py --worktree
+
+      - name: Run harness regression tests
+        run: python3 tests/test_harness.py

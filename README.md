@@ -5,6 +5,7 @@
 - **架构演进与核心设计决定**：见 [BLUEPRINT.md](./BLUEPRINT.md)
 - **跨项目全局工程与安全底线**：见 [global-principles.md](./harness/rules/global-principles.md)
 - **本机私有跨仓地图模板（可选）**：见 [PORTFOLIO.example.md](./PORTFOLIO.example.md)（复制为 `PORTFOLIO.local.md` 使用，默认不入库）
+- **开源协议**：[MIT License](./LICENSE)
 
 ---
 
@@ -17,7 +18,35 @@
 
 ---
 
-## 二、常用命令（`bin/ws`）
+## 二、快速开始（Quick Start）
+
+### 环境要求
+- **Python 3.9+**（`bin/ws` 与核心安全/门禁检查器均基于 Python 标准库，零三方 Python 依赖）
+- **Git**（支持 `git worktree` 与 `core.hooksPath`）
+- **Node.js + Chrome / Chromium（可选）**：仅用于原型浏览器自检（`harness/guards/check_prototype.mjs`）及完整回归测试中的无头浏览器用例
+
+### 安装与自检
+```bash
+# 1. 克隆母仓
+git clone https://github.com/chenfuyuan/agent-harness.git ~/code/agent-harness
+cd ~/code/agent-harness
+
+# 2. （可选）安装原型浏览器自检依赖（playwright-core）
+npm --prefix harness/guards install
+
+# 3. （可选）若在本地演进母仓自身，启用预提交密钥扫描与回归钩子
+git config core.hooksPath .githooks
+
+# 4. 环境体检与母仓回归测试
+./bin/ws doctor
+python3 tests/test_harness.py
+```
+
+> 建议将 `~/code/agent-harness/bin` 加入 `PATH`（或直接通过 `./bin/ws` 调用），即可在任意新旧项目目录中使用 `ws init` 挂载工作流。
+
+---
+
+## 三、常用命令（`bin/ws`）
 
 ```bash
 # 1. 初始化新项目仓（可传目标路径，也可进入新建目录后直接运行默认初始化当前目录）
@@ -63,7 +92,7 @@ python3 tests/test_harness.py
 
 ---
 
-## 三、当前内置核心技能（产品设计开发包）
+## 四、当前内置核心技能（产品设计开发包）
 
 | 技能名 | 阶段 | 职责摘要 |
 | :--- | :--- | :--- |
@@ -75,9 +104,15 @@ python3 tests/test_harness.py
 
 ---
 
-## 四、多领域扩展边界（通用内核 + 可选技能包）
+## 五、多领域扩展边界（通用内核 + 可选技能包）
 
 后续扩展数据分析、部署发布、运维排障等能力时，遵循**“方法论进母仓、运行态进下游仓”**原则：
 
 - **沉淀在本母仓的内容**：教 AI 标准作业与防呆的通用技能及检查器（如上线前核查与回滚 SOP、线上故障止血流程、数据口径对齐与确定性统计规范）；新增非产品类技能包时，计划通过 `ws init --profile <pack>` 按项目类型选配挂载（**该参数尚未实现**），避免纯数据或纯运维仓库被迫走前端 HTML 原型门禁。
 - **另建独立下游仓库的内容**：真实服务器容器编排、网关监控与备份配置（如 `infra-ops` 仓），以及具体业务的数据管道与分析报表工程（如 `data-lab` 仓）。
+
+---
+
+## 六、开源协议
+
+本项目基于 [MIT License](./LICENSE) 开源。
