@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+python3 "$REPO_ROOT/harness/guards/check_secrets.py"
+
+if git diff --cached --name-only | grep -Eq '^(bin/|harness/|tests/)'; then
+  python3 "$REPO_ROOT/tests/test_harness.py"
+fi

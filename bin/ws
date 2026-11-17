@@ -1,0 +1,2244 @@
+#!/usr/bin/env python3
+"""ws — 通用 AI 工程工作流母仓（agent-harness）命令行管理器
+
+子命令：
+  ws init [project_dir] [--name <显示名称>] [--mode <design|build>]  初始化新仓或无损接入存量仓（默认当前目录）
+  ws mode <design|build> [project_dir] [--slice <path>] [--local]    切换阶段门禁（支持 --local 工作树本地覆盖）
+  ws line <new|list|check|sync|rm> ...                               管理基于 git worktree 的多需求并行开发线
+  ws map [target] [--max-lines <N>] [--depth <N>]                    生成目录或文件的 AST 符号与章节行号骨架地图
+  ws check [project_dir] [--diff] [--record-full | --verify-full]    运行质量与安全门禁，签发或核验跨工作树共享全量代码树凭证
+  ws link [project_dir]                                              修复或重连软链接、原型胶囊与三端钩子
+  ws sync [project_dir]                                              同步母仓最新技能、宪章区块与原型胶囊至业务仓
+  ws promote <idea> <target_dir> [--name <名称>]                     将 sandbox/<idea> 脑暴成果毕业迁出为正式业务仓
+  ws doctor [project_dir]                                            体检三端软链接、阶段钩子、浏览器与全局 MCP 状态
+"""
+from __future__ import annotations
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+
+HUB_ROOT = Path(__file__).resolve().parent.parent
+SKILLS_SRC = HUB_ROOT / "harness" / "skills"
+CHARTER_FILE = HUB_ROOT / "harness" / "rules" / "charter-block.md"
+AGENTS_TPL = HUB_ROOT / "harness" / "rules" / "project-agents.template.md"
+OVERLAY_RUNTIME = HUB_ROOT / "harness" / "runtime" / "dev-overlay.js"
+MODE_GUARD = HUB_ROOT / "harness" / "guards" / "mode_guard.py"
+READ_GUARD = HUB_ROOT / "harness" / "guards" / "read_guard.py"
+CODE_OUTLINE = HUB_ROOT / "harness" / "guards" / "code_outline.py"
+SECRETS_GUARD = HUB_ROOT / "harness" / "guards" / "check_secrets.py"
+ANTI_STUB_GUARD = HUB_ROOT / "harness" / "guards" / "check_anti_stub.py"
+PROTO_CHECKER = HUB_ROOT / "harness" / "guards" / "check_prototype.mjs"
+
+
+def get_registry_file() -> Path:
+    env_reg = os.environ.get("WS_REGISTRY_FILE")
+    return Path(env_reg).expanduser().resolve() if env_reg else (HUB_ROOT / ".ws-registry.json")
+
+
+def get_sandbox_root() -> Path:
+    env_sbx = os.environ.get("WS_SANDBOX_DIR")
+    return Path(env_sbx).expanduser().resolve() if env_sbx else (HUB_ROOT / "sandbox")
+
+
+HARNESS_BLOCK_RE = re.compile(
+    r"<!-- HARNESS:START.*?-->.*?<!-- HARNESS:END -->",
+    re.DOTALL,
+)
+MODE_LINE_RE = re.compile(
+    r"^(\s*(?:-\s*)?\*{0,2}Mode\*{0,2}\s*:\s*)`?(design|build)`?(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+SLICE_LINE_RE = re.compile(
+    r"^(\s*(?:-\s*)?\*{0,2}Active-Slice\*{0,2}\s*:\s*)`?[^`\n]*`?(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+HUB_REF_LINE_RE = re.compile(
+    r"^(\s*(?:-\s*)?\*{0,2}Hub-Ref\*{0,2}\s*:\s*)`?[^`\n]*`?(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+H1_LINE_RE = re.compile(r"^#\s+.+$", re.MULTILINE)
+GITHOOK_GUARD_BLOCK_RE = re.compile(
+    r"# ws-harness-guard:start.*?# ws-harness-guard:end\n?",
+    re.DOTALL,
+)
+
+AGY_PRETOOL_MATCHER = (
+    "write_file|edit_file|create_file|replace_file_content|multi_replace_file_content|run_command"
+)
+AGY_READ_MATCHER = "read_file|view_file"
+CLAUDE_PRETOOL_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash"
+CLAUDE_READ_MATCHER = "Read"
+CLAUDE_POSTTOOL_MATCHER = "Bash"
+GITHOOK_GUARD_MARKER = "# ws-harness-guard:start"
+# Husky ≤ 8 的钩子第二行固定是引导脚本，门禁片段要放在它后面
+HUSKY_BOOTSTRAP_RE = re.compile(r"^\s*\.\s.*husky\.sh")
+# 行首的 exec / exit 会无条件结束脚本；`cmd || exit 1` 这类条件退出不算
+HOOK_TERMINATOR_RE = re.compile(r"^[ \t]*(?:exec|exit)\b", re.MULTILINE)
+MANAGED_GITHOOK_HEADER = "# Managed by agent-harness/bin/ws"
+
+REQUIRED_GITIGNORE_LINES = [
+    ".DS_Store",
+    ".env",
+    ".env.*",
+    "!.env.example",
+    "!.env.sample",
+    "!.env.template",
+    ".mcp.json",
+    ".claude/settings.local.json",
+    ".agents/hooks.json",
+    ".githooks/",
+    "node_modules/",
+]
+
+
+class WsError(Exception):
+    """可预期的使用侧错误：打印说明后以非零码退出，不输出堆栈。"""
+
+
+def load_registry() -> list[str]:
+    reg_file = get_registry_file()
+    if not reg_file.is_file():
+        return []
+    try:
+        data = json.loads(reg_file.read_text(encoding="utf-8"))
+        return [p for p in data.get("projects", []) if isinstance(p, str)]
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def save_registry(projects: list[str]):
+    reg_file = get_registry_file()
+    reg_file.parent.mkdir(parents=True, exist_ok=True)
+    unique = sorted({str(Path(p).resolve()) for p in projects if Path(p).exists()})
+    reg_file.write_text(json.dumps({"projects": unique}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def register_project(proj: Path):
+    items = load_registry()
+    items.append(str(proj.resolve()))
+    save_registry(items)
+
+
+def smart_symlink_target(src: Path, link_parent: Path) -> str:
+    """仅当源与目标均在当前用户主目录下且相对层级合理时生成相对软链接，否则回退绝对路径。"""
+    src_real = src.resolve()
+    parent_real = link_parent.resolve()
+    home_real = Path.home().resolve()
+    try:
+        if home_real in src_real.parents and (parent_real == home_real or home_real in parent_real.parents):
+            rel = os.path.relpath(src_real, parent_real)
+            if not rel.startswith("../../../../../"):
+                return rel
+    except ValueError:
+        pass
+    return str(src_real)
+
+
+def hub_ref() -> str:
+    """业务仓 AGENTS.md 里记录的母仓位置。
+
+    母仓在主目录下时写成 `~/...`：不把本机用户名写进会入库的文件，并且对主目录和各并行工作树（层级深浅不同）都成立；
+    否则回退绝对路径。
+    """
+    try:
+        return "~/" + HUB_ROOT.relative_to(Path.home().resolve()).as_posix()
+    except ValueError:
+        return str(HUB_ROOT)
+
+
+def has_tracked_files(proj: Path, rel_dir: str) -> bool:
+    res = subprocess.run(["git", "ls-files", "--", rel_dir], cwd=str(proj), capture_output=True, text=True)
+    return res.returncode == 0 and bool(res.stdout.strip())
+
+
+def ensure_git_info_exclude(proj: Path, linked_skills: list[str] | tuple = ()):
+    """将母仓本机软链与钩子路径同步写入 <git-common-dir>/info/exclude，防主仓未提交最新 .gitignore 时弄脏并行工作树。"""
+    res = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=str(proj), capture_output=True, text=True)
+    if res.returncode != 0 or not res.stdout.strip():
+        return
+    raw_common = Path(res.stdout.strip())
+    common_dir = (raw_common if raw_common.is_absolute() else (proj / raw_common)).resolve()
+    excl_file = common_dir / "info" / "exclude"
+    try:
+        excl_file.parent.mkdir(parents=True, exist_ok=True)
+        existing = excl_file.read_text(encoding="utf-8", errors="replace").splitlines() if excl_file.is_file() else []
+        existing_set = {ln.strip() for ln in existing}
+        entries = [".agents/hooks.json", ".claude/settings.local.json", ".claude/skills"]
+        if not has_tracked_files(proj, ".githooks"):
+            entries.append(".githooks/")
+        entries += [f".agents/skills/{name}" for name in linked_skills]
+        missing = [e for e in entries if e not in existing_set]
+        if missing:
+            prefix = "\n" if existing and existing[-1].strip() else ""
+            with excl_file.open("a", encoding="utf-8") as fh:
+                if prefix:
+                    fh.write(prefix)
+                for item in missing:
+                    fh.write(item + "\n")
+    except OSError:
+        return
+
+
+def ensure_gitignore(proj: Path, linked_skills: list[str] | tuple = ()):
+    gi = proj / ".gitignore"
+    existing = gi.read_text(encoding="utf-8").splitlines() if gi.is_file() else []
+    existing_set = {ln.strip() for ln in existing}
+    # 项目自己已把 .githooks/ 里的钩子入库（团队共享钩子）时，不把该目录写进忽略清单
+    required = [
+        ln for ln in REQUIRED_GITIGNORE_LINES
+        if not (ln == ".githooks/" and has_tracked_files(proj, ".githooks"))
+    ]
+    # 母仓技能软链接是本机产物（每个检出位置算出的链接目标不同），不入库；项目自有的实体技能目录不受影响
+    required += [f".agents/skills/{name}" for name in linked_skills]
+    added = [ln for ln in required if ln not in existing_set]
+    if added:
+        prefix = "\n" if existing and existing[-1].strip() else ""
+        with gi.open("a", encoding="utf-8") as f:
+            if not existing:
+                f.write("# Managed baseline ignores\n")
+            elif prefix:
+                f.write(prefix)
+            for ln in added:
+                f.write(ln + "\n")
+    if (proj / ".git").exists():
+        ensure_git_info_exclude(proj, linked_skills)
+
+
+def build_githook_guard_snippet() -> str:
+    """提交前门禁片段。
+
+    母仓位置在运行时取自 WS_HUB_ROOT 或 AGENTS.md 的 Hub-Ref（支持 `~/...`、绝对路径与相对项目根的路径），
+    片段本身不含本机路径（Husky 等钩子文件通常会入库）；每条门禁显式 `|| exit 1`，不依赖宿主钩子是否开启 `set -e`。
+    """
+    return (
+        f"{GITHOOK_GUARD_MARKER}\n"
+        '_WS_ROOT="$(git rev-parse --show-toplevel)"\n'
+        "_WS_HUB=\"${WS_HUB_ROOT:-$(awk -F '\\140' '/Hub-Ref[*]*[ ]*:/{print $2; exit}' "
+        '"$_WS_ROOT/AGENTS.md" 2>/dev/null || true)}"\n'
+        'case "$_WS_HUB" in "~/"*) _WS_HUB="$HOME/${_WS_HUB#"~/"}" ;; /*|"") ;; *) _WS_HUB="$_WS_ROOT/$_WS_HUB" ;; esac\n'
+        'if [ -f "$_WS_HUB/harness/guards/mode_guard.py" ]; then\n'
+        '  python3 "$_WS_HUB/harness/guards/mode_guard.py" --git-staged || exit 1\n'
+        '  python3 "$_WS_HUB/harness/guards/check_secrets.py" || exit 1\n'
+        "else\n"
+        '  echo "[ws] 警告：未找到工作流母仓（Hub-Ref: ${_WS_HUB:-未声明}），已跳过阶段门禁与密钥检查；'
+        '可设置 WS_HUB_ROOT 或在母仓运行 ws sync 修复。" >&2\n'
+        "fi\n"
+        "# ws-harness-guard:end\n"
+    )
+
+
+def read_json_config(path: Path) -> dict:
+    """读取已有 JSON 配置；内容无法解析时中止而不是当作空配置覆盖，避免冲掉用户手写的权限与钩子。"""
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise WsError(
+            f"{path} 不是合法 JSON（第 {exc.lineno} 行：{exc.msg}）。为避免覆盖其中已有配置已中止；"
+            "请先修正该文件（常见原因是注释或尾逗号）后重试。"
+        )
+    if not isinstance(data, dict):
+        raise WsError(f"{path} 顶层不是 JSON 对象，无法安全合并钩子配置；请先修正后重试。")
+    return data
+
+
+def inject_guard_snippet(hook_text: str, snippet: str) -> str:
+    """把门禁片段放到宿主钩子的最前面（紧跟 shebang 与 Husky 引导行之后），原有逻辑原样保留在后面。
+
+    宿主钩子常以 `exec ...` 或 `exit` 收尾，追加在末尾的片段永远执行不到；旧版本追加在末尾的片段也会被挪到前面。
+    """
+    body = GITHOOK_GUARD_BLOCK_RE.sub("", hook_text)
+    lines = body.splitlines()
+    idx = 1 if lines and lines[0].startswith("#!") else 0
+    while idx < len(lines) and HUSKY_BOOTSTRAP_RE.search(lines[idx]):
+        idx += 1
+    head = "\n".join(lines[:idx]).rstrip("\n")
+    tail = "\n".join(lines[idx:]).strip("\n")
+    return (head + "\n" if head else "") + snippet + ("\n" + tail + "\n" if tail else "")
+
+
+def guard_snippet_reachable(hook_text: str) -> bool:
+    """门禁片段存在，且它前面没有会提前结束脚本的 `exec` / `exit` 语句。"""
+    pos = hook_text.find(GITHOOK_GUARD_MARKER)
+    return pos >= 0 and not HOOK_TERMINATOR_RE.search(hook_text[:pos])
+
+
+def effective_guard_hooks(proj: Path) -> list[Path]:
+    """Git 提交时实际会调用的 pre-commit 钩子文件（按 core.hooksPath 解析）。"""
+    res = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=str(proj), capture_output=True, text=True)
+    if res.returncode != 0:
+        return []
+    hooks_dir = (proj / res.stdout.strip()).resolve()
+    candidates = [hooks_dir / "pre-commit"]
+    # Husky v9 的 core.hooksPath 指向 .husky/_，其中的桩脚本再转调 .husky/pre-commit
+    if hooks_dir.name == "_" and hooks_dir.parent.name == ".husky":
+        candidates.append(hooks_dir.parent / "pre-commit")
+    return [hook for hook in candidates if hook.is_file()]
+
+
+def active_guard_hook(proj: Path) -> Path | None:
+    """返回 Git 实际会调用、且门禁片段真正执行得到的 pre-commit 钩子文件；门禁未真正生效时返回 None。"""
+    for hook in effective_guard_hooks(proj):
+        if guard_snippet_reachable(hook.read_text(encoding="utf-8", errors="replace")):
+            return hook
+    return None
+
+
+def linked_worktrees(proj: Path) -> list[Path]:
+    """项目的其他 Git 工作树（并行开发线）。
+
+    只返回 AGENTS.md 已带宪章区块的：停在接入之前旧提交上的检出（如固定版本的验收环境）不往里放任何文件。
+    """
+    res = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=str(proj), capture_output=True, text=True)
+    if res.returncode != 0:
+        return []
+    main = proj.resolve()
+    trees: list[Path] = []
+    for line in res.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        wt = Path(line[len("worktree "):]).resolve()
+        agents_md = wt / "AGENTS.md"
+        if wt != main and agents_md.is_file() and "HARNESS:START" in agents_md.read_text(encoding="utf-8", errors="replace"):
+            trees.append(wt)
+    return trees
+
+
+def agy_guard_wired(hooks_file: Path) -> bool:
+    """Antigravity 的阶段门禁（mode_guard）与大文件读取守卫（read_guard）是否都已挂载。"""
+    try:
+        data = json.loads(hooks_file.read_text(encoding="utf-8"))
+        raw = json.dumps(data)
+        return "mode_guard.py" in raw and "read_guard.py" in raw
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def claude_guard_wired(settings: Path) -> bool:
+    """Claude Code 的事前（mode_guard + read_guard）与事后（mode_guard）钩子是否都已挂载。"""
+    try:
+        hooks = json.loads(settings.read_text(encoding="utf-8")).get("hooks", {})
+        pre_raw = json.dumps(hooks.get("PreToolUse", []))
+        post_raw = json.dumps(hooks.get("PostToolUse", []))
+        return (
+            "mode_guard.py" in pre_raw
+            and "read_guard.py" in pre_raw
+            and "mode_guard.py" in post_raw
+        )
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def ensure_executable(path: Path):
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def write_hooks(proj: Path):
+    write_tool_hooks(proj)
+    write_git_hook(proj)
+
+
+def write_tool_hooks(proj: Path):
+    guard_cmd = f'python3 "{MODE_GUARD}"'
+    read_guard_cmd = f'python3 "{READ_GUARD}"'
+    agy_hooks_file = proj / ".agents" / "hooks.json"
+    claude_settings = proj / ".claude" / "settings.local.json"
+
+    # 先把两份已有配置都读出来：任何一份无法解析就整体中止，不留下只写了一半的钩子
+    agy_cfg = read_json_config(agy_hooks_file)
+    c_data = read_json_config(claude_settings)
+    hooks_obj = c_data.setdefault("hooks", {})
+    if not isinstance(hooks_obj, dict):
+        raise WsError(f"{claude_settings} 的 `hooks` 字段不是 JSON 对象，无法安全合并钩子配置；请先修正后重试。")
+
+    # 1. Antigravity (.agents/hooks.json - 无损保留其他自定义 hook 键)
+    agy_hooks_file.parent.mkdir(parents=True, exist_ok=True)
+    agy_cfg["mode-gate"] = {
+        "PreToolUse": [
+            {
+                "matcher": AGY_PRETOOL_MATCHER,
+                "hooks": [{"type": "command", "command": guard_cmd, "timeout": 10}],
+            }
+        ]
+    }
+    agy_cfg["read-guard"] = {
+        "PreToolUse": [
+            {
+                "matcher": AGY_READ_MATCHER,
+                "hooks": [{"type": "command", "command": read_guard_cmd, "timeout": 10}],
+            }
+        ]
+    }
+    agy_hooks_file.write_text(json.dumps(agy_cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    # 2. Claude Code (.claude/settings.local.json - 无损合并已有钩子与其他配置)
+    #    PreToolUse 事前拦截阶段越界写入与大文件无行号吞读；PostToolUse 在终端命令跑完后核对工作区实际改动
+    claude_settings.parent.mkdir(parents=True, exist_ok=True)
+    pre_existing = hooks_obj.get("PreToolUse") if isinstance(hooks_obj.get("PreToolUse"), list) else []
+    pre_preserved = [
+        item for item in pre_existing
+        if not (
+            isinstance(item, dict)
+            and any(
+                isinstance(h, dict)
+                and any(g in str(h.get("command", "")) for g in ("mode_guard.py", "read_guard.py"))
+                for h in (item.get("hooks") or [])
+            )
+        )
+    ]
+    pre_preserved.extend(
+        [
+            {"matcher": CLAUDE_PRETOOL_MATCHER, "hooks": [{"type": "command", "command": guard_cmd}]},
+            {"matcher": CLAUDE_READ_MATCHER, "hooks": [{"type": "command", "command": read_guard_cmd}]},
+        ]
+    )
+    hooks_obj["PreToolUse"] = pre_preserved
+
+    post_existing = hooks_obj.get("PostToolUse") if isinstance(hooks_obj.get("PostToolUse"), list) else []
+    post_preserved = [
+        item for item in post_existing
+        if not (
+            isinstance(item, dict)
+            and any(
+                isinstance(h, dict) and "mode_guard.py" in str(h.get("command", ""))
+                for h in (item.get("hooks") or [])
+            )
+        )
+    ]
+    post_preserved.append({"matcher": CLAUDE_POSTTOOL_MATCHER, "hooks": [{"type": "command", "command": guard_cmd}]})
+    hooks_obj["PostToolUse"] = post_preserved
+    claude_settings.write_text(json.dumps(c_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def write_git_hook(proj: Path):
+    """Git pre-commit（无损兼容存量 Husky 或自定义钩子，兜底 Codex 与手工提交）。"""
+    snippet = build_githook_guard_snippet()
+    husky_pre = proj / ".husky" / "pre-commit"
+    if husky_pre.is_file():
+        # 存量 Husky 工程：不抢夺 core.hooksPath，幂等注入守卫块
+        h_txt = husky_pre.read_text(encoding="utf-8")
+        injected = inject_guard_snippet(h_txt, snippet)
+        if injected != h_txt:
+            husky_pre.write_text(injected, encoding="utf-8")
+        ensure_executable(husky_pre)
+        if (proj / ".git").exists() and not active_guard_hook(proj):
+            print(
+                f"  [提示] {proj.name}：门禁已写入 .husky/pre-commit，但 Git 目前不会调用它（core.hooksPath 未指向 Husky）。\n"
+                "         请先运行 `npm install`（或 `npx husky`）激活 Husky，再用 `ws doctor` 确认提交门禁已生效。",
+                file=sys.stderr,
+            )
+        return
+
+    githooks_dir = proj / ".githooks"
+    githooks_dir.mkdir(parents=True, exist_ok=True)
+    pre_commit = githooks_dir / "pre-commit"
+
+    if pre_commit.is_file() and MANAGED_GITHOOK_HEADER not in pre_commit.read_text(encoding="utf-8", errors="replace"):
+        # 存量项目已有自定义 .githooks/pre-commit：无损注入/更新守卫片段（内容没变就不重写，避免无谓改动已入库文件）
+        existing_hook = pre_commit.read_text(encoding="utf-8")
+        updated_hook = inject_guard_snippet(existing_hook, snippet)
+        if updated_hook != existing_hook:
+            pre_commit.write_text(updated_hook, encoding="utf-8")
+    else:
+        # 标准托管钩子：执行母仓门禁后，若原 .git/hooks/pre-commit 存在自定义脚本也链式调用
+        pre_commit.write_text(
+            "#!/bin/sh\n"
+            f"{MANAGED_GITHOOK_HEADER}\n"
+            "set -e\n"
+            f"{snippet}"
+            'GIT_STD_HOOK="$(git rev-parse --git-common-dir 2>/dev/null || true)/hooks/pre-commit"\n'
+            'if [ -x "$GIT_STD_HOOK" ]; then\n'
+            '  "$GIT_STD_HOOK" "$@"\n'
+            "fi\n",
+            encoding="utf-8",
+        )
+    ensure_executable(pre_commit)
+    if (proj / ".git").exists():
+        subprocess.run(["git", "config", "core.hooksPath", ".githooks"], cwd=str(proj), check=False)
+
+
+def link_skills(proj: Path) -> list[str]:
+    linked = []
+    skills_dst = proj / ".agents" / "skills"
+    skills_dst.mkdir(parents=True, exist_ok=True)
+
+    # 清理已失效的断链
+    for item in skills_dst.iterdir():
+        if item.is_symlink() and not item.exists():
+            item.unlink()
+
+    for skill_dir in sorted(SKILLS_SRC.iterdir()):
+        if not skill_dir.is_dir() or not (skill_dir / "SKILL.md").is_file():
+            continue
+        dst = skills_dst / skill_dir.name
+        target_str = smart_symlink_target(skill_dir, skills_dst)
+        if dst.is_symlink():
+            if os.readlink(dst) != target_str:
+                dst.unlink()
+                dst.symlink_to(target_str)
+            linked.append(skill_dir.name)
+        elif dst.exists():
+            # 保留项目自定义同名实体技能目录，不覆盖
+            continue
+        else:
+            dst.symlink_to(target_str)
+            linked.append(skill_dir.name)
+
+    # Claude Code 软链接桥接：.claude/skills -> ../.agents/skills
+    claude_skills = proj / ".claude" / "skills"
+    claude_skills.parent.mkdir(parents=True, exist_ok=True)
+    if claude_skills.is_symlink():
+        if os.readlink(claude_skills) != "../.agents/skills":
+            claude_skills.unlink()
+            claude_skills.symlink_to("../.agents/skills")
+    elif claude_skills.is_dir() and not any(claude_skills.iterdir()):
+        # 若为空目录则自动替换为软链接桥接
+        claude_skills.rmdir()
+        claude_skills.symlink_to("../.agents/skills")
+    elif not claude_skills.exists():
+        claude_skills.symlink_to("../.agents/skills")
+
+    return linked
+
+
+def sync_prototype_runtime(proj: Path):
+    """将无侵入悬浮胶囊 dev-overlay.js 同步至业务仓 design/prototype/，确保本地 file:// 与沙盒内零跨仓障碍。"""
+    if proj == HUB_ROOT or not OVERLAY_RUNTIME.is_file():
+        return
+    proto_dir = proj / "design" / "prototype"
+    if proto_dir.is_dir():
+        shutil.copyfile(OVERLAY_RUNTIME, proto_dir / "dev-overlay.js")
+
+
+def ensure_claude_bridge(proj: Path):
+    claude_md = proj / "CLAUDE.md"
+    if not claude_md.exists():
+        claude_md.write_text(
+            "@AGENTS.md\n\n"
+            "# Claude Code 适配入口\n\n"
+            "唯一协作规则与当前阶段状态见上方导入的 `AGENTS.md`；技能由 `.claude/skills` 指向 `.agents/skills` 共用。\n",
+            encoding="utf-8",
+        )
+        return
+    txt = claude_md.read_text(encoding="utf-8")
+    if "@AGENTS.md" not in txt:
+        claude_md.write_text("@AGENTS.md\n\n" + txt, encoding="utf-8")
+
+
+def build_state_section(initial_mode: str, hub_ref: str) -> str:
+    return (
+        "## 项目状态（Project State）\n\n"
+        f"- **Mode**: `{initial_mode}`\n"
+        "- **Active-Slice**: `none`\n"
+        f"- **Hub-Ref**: `{hub_ref}`"
+    )
+
+
+def sync_charter_in_agents(proj: Path, default_name: str = "", initial_mode: str = "design") -> str:
+    charter = CHARTER_FILE.read_text(encoding="utf-8").strip()
+    ref = hub_ref()
+    agents_file = proj / "AGENTS.md"
+    if not agents_file.is_file():
+        tpl = AGENTS_TPL.read_text(encoding="utf-8")
+        rendered = (
+            tpl.replace("{{PROJECT_NAME}}", default_name or proj.name)
+            .replace("{{INITIAL_MODE}}", initial_mode)
+            .replace("{{HUB_REF}}", ref)
+            .replace("{{CHARTER_BLOCK}}", charter)
+        )
+        agents_file.write_text(rendered.rstrip() + "\n", encoding="utf-8")
+        return "created"
+
+    content = agents_file.read_text(encoding="utf-8")
+    updated = content
+
+    if proj != HUB_ROOT:
+        if not MODE_LINE_RE.search(updated):
+            # 存量老仓库已有 AGENTS.md 但缺失 Mode 状态头时，自动补齐以确保门禁真实生效
+            state_sec = build_state_section(initial_mode, ref)
+            h1_match = H1_LINE_RE.search(updated)
+            if h1_match:
+                pos = h1_match.end()
+                updated = updated[:pos] + "\n\n" + state_sec + "\n" + updated[pos:]
+            else:
+                updated = state_sec + "\n\n" + updated
+        elif HUB_REF_LINE_RE.search(updated):
+            # 母仓搬家或旧版写入的绝对/相对路径：每次同步都把 Hub-Ref 校正为当前母仓位置
+            updated = HUB_REF_LINE_RE.sub(lambda m: f"{m.group(1)}`{ref}`{m.group(2)}", updated, count=1)
+        else:
+            updated = MODE_LINE_RE.sub(lambda m: f"{m.group(0)}\n- **Hub-Ref**: `{ref}`", updated, count=1)
+
+    if HARNESS_BLOCK_RE.search(updated):
+        updated = HARNESS_BLOCK_RE.sub(lambda _: charter, updated)
+    else:
+        updated = updated.rstrip() + "\n\n" + charter + "\n"
+
+    if updated != content:
+        agents_file.write_text(updated, encoding="utf-8")
+        return "updated"
+    return "unchanged"
+
+
+def cmd_init(args):
+    proj = Path(args.project_dir or os.getcwd()).expanduser().resolve()
+    if proj == HUB_ROOT:
+        print(
+            "错误：当前目录为工作流母仓（agent-harness），不能将母仓自身初始化为下游项目。\n"
+            "请先进入新建的项目目录再执行 `ws init --name \"项目名称\"`，或显式传入路径 `ws init ~/code/<project>`。\n"
+            "（若需修复母仓自身的技能软链接，请运行 `./bin/ws link .`。）",
+            file=sys.stderr,
+        )
+        return 1
+
+    # 动任何文件之前先确认已有钩子配置可解析，避免初始化到一半才失败
+    read_json_config(proj / ".agents" / "hooks.json")
+    read_json_config(proj / ".claude" / "settings.local.json")
+
+    proj.mkdir(parents=True, exist_ok=True)
+    if not (proj / ".git").exists():
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(proj), check=True, capture_output=True)
+
+    (proj / "design" / "prototype").mkdir(parents=True, exist_ok=True)
+    (proj / "design" / "slices").mkdir(parents=True, exist_ok=True)
+
+    initial_mode = args.mode or "design"
+    agents_status = sync_charter_in_agents(proj, args.name or proj.name, initial_mode=initial_mode)
+    ensure_claude_bridge(proj)
+    linked = link_skills(proj)
+    ensure_gitignore(proj, linked)
+    sync_prototype_runtime(proj)
+    write_hooks(proj)
+    register_project(proj)
+
+    cur_mode_match = MODE_LINE_RE.search((proj / "AGENTS.md").read_text(encoding="utf-8"))
+    actual_mode = cur_mode_match.group(2).lower() if cur_mode_match else initial_mode
+
+    print(f"已初始化项目空间：{proj}")
+    print(f"  - AGENTS.md: {agents_status}（当前生效阶段 Mode: {actual_mode}）")
+    print(f"  - 已挂载三端技能 ({len(linked)}): {', '.join(linked)}")
+    print("  - 已同步原型胶囊：design/prototype/dev-overlay.js")
+    print("  - 已启用三端门禁钩子：.agents/hooks.json (agy) | .claude/settings.local.json (Claude) | Git pre-commit (Codex/Git)")
+    return 0
+
+
+LOCAL_MODE_STATE_FILE = "ws-mode-state.json"
+
+
+def resolve_git_dir(proj: Path) -> Path | None:
+    """解析项目或并行 git worktree 专属的 Git 目录（主仓为 `.git/`，工作树为 `.git/worktrees/<name>/`）。"""
+    dot_git = proj / ".git"
+    if dot_git.is_dir():
+        return dot_git.resolve()
+    if dot_git.is_file():
+        try:
+            first = dot_git.read_text(encoding="utf-8", errors="replace").splitlines()[0].strip()
+        except (OSError, IndexError):
+            return None
+        if first.lower().startswith("gitdir:"):
+            raw = first.split(":", 1)[1].strip()
+            target = Path(raw)
+            if not target.is_absolute():
+                target = proj / target
+            resolved = target.resolve()
+            if resolved.is_dir():
+                return resolved
+    return None
+
+
+def read_local_mode_state(proj: Path) -> dict | None:
+    git_dir = resolve_git_dir(proj)
+    state_file = (git_dir / LOCAL_MODE_STATE_FILE) if git_dir else None
+    if not state_file or not state_file.is_file():
+        return None
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(data, dict) and str(data.get("mode", "")).lower() in ("design", "build"):
+        return data
+    return None
+
+
+def cmd_mode(args):
+    if args.local and args.clear_local:
+        print("错误：`--local` 与 `--clear-local` 不能同时使用。", file=sys.stderr)
+        return 1
+
+    mode_args = list(args.mode_args or [])
+    if args.clear_local:
+        if len(mode_args) > 1 or (mode_args and mode_args[0] in ("design", "build")):
+            print("错误：用法为 `ws mode --clear-local [project_dir]`。", file=sys.stderr)
+            return 1
+        target_mode = None
+        proj_arg = mode_args[0] if mode_args else ""
+    else:
+        if not mode_args or mode_args[0] not in ("design", "build") or len(mode_args) > 2:
+            print(
+                "错误：用法为 `ws mode <design|build> [project_dir] [--slice <path>] [--local]` "
+                "或 `ws mode --clear-local [project_dir]`。",
+                file=sys.stderr,
+            )
+            return 1
+        target_mode = mode_args[0]
+        proj_arg = mode_args[1] if len(mode_args) == 2 else ""
+
+    proj = Path(proj_arg or os.getcwd()).expanduser().resolve()
+    if proj == HUB_ROOT:
+        print(
+            "错误：当前目录为工作流母仓（agent-harness），母仓自身不启用业务仓 Mode 状态。\n"
+            "请传入目标业务项目路径，例如：`./bin/ws mode build ~/code/<project>`。",
+            file=sys.stderr,
+        )
+        return 1
+
+    agents_file = proj / "AGENTS.md"
+    if not agents_file.is_file():
+        print(f"错误：在 {proj} 未找到 AGENTS.md，请先运行 `ws init`。", file=sys.stderr)
+        return 1
+
+    git_dir = resolve_git_dir(proj)
+    local_state_file = (git_dir / LOCAL_MODE_STATE_FILE) if git_dir else None
+
+    if args.clear_local:
+        if local_state_file and local_state_file.exists():
+            local_state_file.unlink()
+        cur_match = MODE_LINE_RE.search(agents_file.read_text(encoding="utf-8", errors="replace"))
+        fallback_mode = cur_match.group(2).lower() if cur_match else "design"
+        print(f"[{proj.name}] 已清除工作树本地 Mode 覆盖（恢复继承 AGENTS.md -> Mode: {fallback_mode}）")
+        return 0
+
+    if args.local:
+        if local_state_file is None:
+            print(f"错误：`--local` 需要目标目录是 Git 仓库或 git worktree：{proj}", file=sys.stderr)
+            return 1
+        prev = read_local_mode_state(proj) or {}
+        payload: dict[str, str] = {"mode": target_mode}
+        eff_slice = args.slice if args.slice is not None else prev.get("slice")
+        if eff_slice:
+            payload["slice"] = str(eff_slice)
+        local_state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        slice_msg = f"（Active-Slice: {payload['slice']}）" if "slice" in payload else ""
+        print(f"[{proj.name}] 已设置当前工作树本地 Mode: {target_mode} {slice_msg}（未修改 AGENTS.md）".strip())
+        return 0
+
+    content = agents_file.read_text(encoding="utf-8")
+    if MODE_LINE_RE.search(content):
+        content = MODE_LINE_RE.sub(lambda m: f"{m.group(1)}`{target_mode}`{m.group(3)}", content, count=1)
+    else:
+        content = f"- **Mode**: `{target_mode}`\n" + content
+
+    if args.slice is not None:
+        if SLICE_LINE_RE.search(content):
+            content = SLICE_LINE_RE.sub(lambda m: f"{m.group(1)}`{args.slice}`{m.group(2)}", content, count=1)
+        else:
+            # 若原文件缺失 Active-Slice 行，紧跟在 Mode 行下方自动补齐
+            content = MODE_LINE_RE.sub(
+                lambda m: f"{m.group(0)}\n- **Active-Slice**: `{args.slice}`",
+                content,
+                count=1,
+            )
+
+    agents_file.write_text(content, encoding="utf-8")
+    cleared_note = ""
+    if local_state_file and local_state_file.exists():
+        local_state_file.unlink()
+        cleared_note = "；已同步清除旧的本地 Mode 覆盖"
+    slice_msg = f"（Active-Slice: {args.slice}）" if args.slice is not None else ""
+    print(f"[{proj.name}] 已切换为 Mode: {target_mode} {slice_msg}{cleared_note}".strip())
+    return 0
+
+
+FULL_CHECK_RECEIPT_FILE = "ws-full-check-passed"
+MAX_FULL_RECEIPTS = 64
+
+
+def is_doc_or_design_path(rel_posix: str) -> bool:
+    """判定纯文档与设计文件（修改它们不使已签发的全量代码凭证失效；源码树内的业务 prompt/*.md 仍按代码计）。"""
+    if rel_posix.startswith(("docs/", "design/")):
+        return True
+    if "/" not in rel_posix and (rel_posix.endswith(".md") or rel_posix == "LICENSE"):
+        return True
+    return Path(rel_posix).name in ("AGENTS.md", "CLAUDE.md")
+
+
+def clean_git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    if extra:
+        env.update(extra)
+    return env
+
+
+def resolve_common_git_dir_for(proj: Path) -> Path | None:
+    res = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=str(proj),
+        capture_output=True,
+        text=True,
+        env=clean_git_env(),
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    raw = Path(res.stdout.strip())
+    resolved = (raw if raw.is_absolute() else (proj / raw)).resolve()
+    return resolved if resolved.is_dir() else None
+
+
+def worktree_code_digest(proj: Path) -> str:
+    git_dir = resolve_git_dir(proj)
+    common_dir = resolve_common_git_dir_for(proj)
+    if git_dir is None or common_dir is None:
+        raise WsError(f"{proj} 不是有效的 Git 仓库，无法签发全量代码树凭证。")
+    with tempfile.TemporaryDirectory(prefix="ws-chk-") as tmp:
+        tmp_path = Path(tmp)
+        idx_file = tmp_path / "index"
+        real_idx = git_dir / "index"
+        if real_idx.is_file():
+            shutil.copy2(real_idx, idx_file)
+        obj_dir = tmp_path / "objects"
+        obj_dir.mkdir()
+        env = clean_git_env({
+            "GIT_INDEX_FILE": str(idx_file),
+            "GIT_OBJECT_DIRECTORY": str(obj_dir),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str((common_dir / "objects").resolve()),
+        })
+        add_res = subprocess.run(["git", "add", "--all"], cwd=str(proj), capture_output=True, text=True, env=env)
+        if add_res.returncode != 0:
+            raise WsError(f"扫描工作区代码指纹失败：{add_res.stderr.strip()}")
+        ls_res = subprocess.run(
+            ["git", "ls-files", "--stage", "-z"],
+            cwd=str(proj),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+            env=env,
+        )
+        if ls_res.returncode != 0:
+            raise WsError(f"读取工作区代码索引失败：{ls_res.stderr.strip()}")
+        entries = sorted(
+            item for item in ls_res.stdout.split("\0")
+            if item and not is_doc_or_design_path(item.split("\t", 1)[1])
+        )
+        return hashlib.sha256("\0".join(entries).encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
+def rev_code_digest(proj: Path, rev: str) -> str:
+    if resolve_common_git_dir_for(proj) is None:
+        raise WsError(f"{proj} 不是有效的 Git 仓库，无法核验全量代码树凭证。")
+    ls_res = subprocess.run(
+        ["git", "ls-tree", "-r", "-z", f"{rev}^{{tree}}"],
+        cwd=str(proj),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+        env=clean_git_env(),
+    )
+    if ls_res.returncode != 0:
+        raise WsError(f"找不到提交 `{rev}`，无法核验全量门禁凭证。")
+    entries: list[str] = []
+    for item in ls_res.stdout.split("\0"):
+        if not item:
+            continue
+        meta, path = item.split("\t", 1)
+        if not is_doc_or_design_path(path):
+            mode, _kind, obj = meta.split(" ")
+            entries.append(f"{mode} {obj} 0\t{path}")
+    entries.sort()
+    return hashlib.sha256("\0".join(entries).encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
+def full_receipt_paths(common_dir: Path) -> tuple[Path, Path]:
+    primary = (common_dir / FULL_CHECK_RECEIPT_FILE).resolve()
+    fb_base = Path(os.environ.get("WS_CHECK_FALLBACK_DIR") or tempfile.gettempdir())
+    if not fb_base.is_dir():
+        fb_base = Path(tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    tag = hashlib.sha256(str(primary).encode("utf-8")).hexdigest()[:16]
+    return primary, fb_base / f"{FULL_CHECK_RECEIPT_FILE}-{uid}-{tag}"
+
+
+def read_full_receipts(common_dir: Path) -> list[str]:
+    seen: list[str] = []
+    for path in full_receipt_paths(common_dir):
+        if path.is_file():
+            for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                val = raw.strip()
+                if len(val) == 64 and val not in seen:
+                    seen.append(val)
+    return seen
+
+
+def record_full_check_receipt(proj: Path, digest: str) -> None:
+    common_dir = resolve_common_git_dir_for(proj)
+    if common_dir is None:
+        raise WsError(f"{proj} 不是有效的 Git 仓库，无法签发全量代码树凭证。")
+    primary, fallback = full_receipt_paths(common_dir)
+    seen = [d for d in read_full_receipts(common_dir) if d != digest] + [digest]
+    text = "\n".join(seen[-MAX_FULL_RECEIPTS:]) + "\n"
+    try:
+        primary.write_text(text, encoding="utf-8")
+        fallback.unlink(missing_ok=True)
+    except OSError:
+        try:
+            fallback.write_text(text, encoding="utf-8")
+            fallback.chmod(0o600)
+        except OSError as exc:
+            raise WsError(f"无法写入全量门禁凭证（{exc}）。") from exc
+
+
+def verify_full_check_receipt(proj: Path, rev: str) -> int:
+    common_dir = resolve_common_git_dir_for(proj)
+    if common_dir is None:
+        raise WsError(f"{proj} 不是有效的 Git 仓库，无法核验全量代码树凭证。")
+    digest = rev_code_digest(proj, rev)
+    if digest in set(read_full_receipts(common_dir)):
+        print(f"[{proj.name}] 全量门禁凭证核验通过（{rev} -> {digest[:12]}）。")
+        return 0
+    raise WsError(
+        f"发布拦截：`{rev}` 的代码尚未在本机签发全量门禁凭证。\n"
+        "请先在本机跑通全量检查并执行 `ws check --record-full`（开发线或主目录均可，纯文档改动不影响已签发凭证），再打标或发布。"
+    )
+
+
+def run_ws_check_on(proj: Path, diff: bool = False, base_ref: str = "") -> int:
+    eff_base = (base_ref or os.environ.get("WS_CHECK_BASE", "")).strip()
+    # 阶段门禁事后核对：Mode: design 下工作区不应出现 design/ 白名单之外的改动（不依赖任何工具钩子，三端通用）
+    gate_cmd = [sys.executable, str(MODE_GUARD), "--worktree", "--cwd", str(proj)]
+    gate_res = subprocess.run(gate_cmd, cwd=str(proj))
+
+    sec_cmd = [sys.executable, str(SECRETS_GUARD), "--worktree", "--cwd", str(proj)]
+    if eff_base:
+        sec_cmd.extend(["--base", eff_base])
+    sec_res = subprocess.run(sec_cmd, cwd=str(proj))
+
+    stub_cmd = [sys.executable, str(ANTI_STUB_GUARD), str(proj)]
+    if diff:
+        stub_cmd.append("--diff")
+    if eff_base:
+        stub_cmd.extend(["--base", eff_base])
+    stub_res = subprocess.run(stub_cmd, cwd=str(proj))
+
+    if gate_res.returncode != 0 or sec_res.returncode != 0 or stub_res.returncode != 0:
+        return 1
+    print(f"[{proj.name}] 全量门禁检查通过（阶段门禁核对 + 密钥扫描 + 反假实现 + 模块契约边界）。")
+    return 0
+
+
+def cmd_check(args):
+    proj = Path(args.project_dir or os.getcwd()).expanduser().resolve()
+    if not proj.is_dir():
+        print(f"错误：找不到目录 {proj}", file=sys.stderr)
+        return 1
+    rec_full = bool(getattr(args, "record_full", False))
+    ver_full = getattr(args, "verify_full", None)
+    if rec_full and ver_full is not None:
+        raise WsError("`--record-full` 与 `--verify-full` 不能同时使用。")
+    if rec_full and bool(args.diff):
+        raise WsError("`--record-full` 用于签发全量门禁凭证，不能与增量 `--diff` 同时使用。")
+    if ver_full is not None:
+        return verify_full_check_receipt(proj, str(ver_full))
+    rc = run_ws_check_on(proj, diff=bool(args.diff), base_ref=str(getattr(args, "base", "") or ""))
+    if rc == 0 and rec_full:
+        digest = worktree_code_digest(proj)
+        record_full_check_receipt(proj, digest)
+        print(f"[{proj.name}] 已签发跨工作树共享全量代码树凭证（{digest[:12]}）。")
+    return rc
+
+
+def iter_target_projects(explicit_dir: str | None) -> list[Path]:
+    if explicit_dir:
+        return [Path(explicit_dir).expanduser().resolve()]
+    reg = [Path(p) for p in load_registry() if Path(p).is_dir()]
+    if not reg:
+        cwd_proj = Path(os.getcwd()).resolve()
+        if (cwd_proj / "AGENTS.md").is_file() and cwd_proj != HUB_ROOT:
+            return [cwd_proj]
+    return reg
+
+
+LINES_STATE_FILE = "ws-lines.json"
+LINES_LOCK_FILE = "ws-lines.lock"
+LINE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$")
+RESERVED_LINE_NAMES = {"main", "master", "head", "develop", "dev", "trunk"}
+SHARED_LOCAL_FILES = (".env", ".env.local", "deploy/.env", ".mcp.json", ".codex/config.toml")
+SAFE_IGNORED_CACHE_NAMES = {
+    ".DS_Store",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    "node_modules",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".next",
+    ".vite",
+    ".turbo",
+    "coverage",
+    ".coverage",
+}
+HARNESS_MANAGED_LOCAL_FILES = {
+    ".agents/hooks.json",
+    ".claude/settings.local.json",
+    ".githooks/pre-commit",
+}
+GIT_IN_PROGRESS_MARKERS = ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
+
+
+def wire_worktree_harness(main_proj: Path, wt: Path) -> tuple[list[str], list[str]]:
+    """为并行工作树装配技能软链、工具钩子、未入库 Git 钩子与共享忽略环境文件，绝不改写已跟踪文件。"""
+    linked = link_skills(wt)
+    ensure_git_info_exclude(wt, linked)
+    write_tool_hooks(wt)
+    if not has_tracked_files(wt, ".husky/pre-commit") and not has_tracked_files(wt, ".githooks/pre-commit"):
+        write_git_hook(wt)
+    shared = link_shared_local_files(main_proj, wt)
+    return linked, shared
+
+
+def link_shared_local_files(main_proj: Path, wt: Path) -> list[str]:
+    """将主仓库中未入库但已被 .gitignore 忽略的本机配置（如 .env、.mcp.json）软链至并行工作树。"""
+    shared: list[str] = []
+    for rel in SHARED_LOCAL_FILES:
+        src = main_proj / rel
+        dst = wt / rel
+        if not (src.is_file() or src.is_symlink()):
+            continue
+        if dst.exists() or dst.is_symlink():
+            continue
+        rel_path = Path(rel)
+        if rel_path.parent != Path(".") and not rel_path.parts[0].startswith("."):
+            if not (wt / rel_path.parent).is_dir():
+                continue
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", rel],
+            cwd=str(main_proj),
+            capture_output=True,
+            text=True,
+        )
+        if tracked.returncode == 0:
+            continue
+        ignored = subprocess.run(
+            ["git", "check-ignore", "-q", "--", rel],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+        )
+        if ignored.returncode != 0:
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.symlink_to(smart_symlink_target(src, dst.parent))
+        shared.append(rel)
+    return shared
+
+
+def link_worktrees(proj: Path) -> int:
+    """给项目的并行工作树补齐本机产物：技能软链接、三端钩子与本机忽略环境文件。返回处理的工作树数。"""
+    trees = linked_worktrees(proj)
+    for wt in trees:
+        wire_worktree_harness(proj, wt)
+    return len(trees)
+
+
+@contextmanager
+def acquire_line_lock(common_git_dir: Path):
+    lock_file = common_git_dir / LINES_LOCK_FILE
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with lock_file.open("a+", encoding="utf-8") as fh:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def parse_worktree_entries(any_dir: Path) -> list[dict]:
+    res = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=str(any_dir), capture_output=True, text=True)
+    if res.returncode != 0:
+        raise WsError(f"{any_dir} 不是有效的 Git 仓库。")
+    entries: list[dict] = []
+    cur: dict | None = None
+    for raw_line in res.stdout.splitlines():
+        if not raw_line.strip():
+            if cur is not None:
+                entries.append(cur)
+                cur = None
+            continue
+        if raw_line.startswith("worktree "):
+            if cur is not None:
+                entries.append(cur)
+            cur = {
+                "path": Path(raw_line[len("worktree "):]).resolve(),
+                "head": "",
+                "branch": "",
+                "detached": False,
+            }
+        elif cur is not None:
+            if raw_line.startswith("HEAD "):
+                cur["head"] = raw_line[len("HEAD "):].strip()
+            elif raw_line.startswith("branch refs/heads/"):
+                cur["branch"] = raw_line[len("branch refs/heads/"):].strip()
+            elif raw_line == "detached":
+                cur["detached"] = True
+    if cur is not None:
+        entries.append(cur)
+    if not entries:
+        raise WsError(f"无法读取 {any_dir} 的 Git 工作树列表。")
+    return entries
+
+
+def resolve_line_context(raw_dir: str | Path = "") -> tuple[Path, Path, list[dict]]:
+    target = Path(raw_dir or os.getcwd()).expanduser().resolve()
+    if not target.exists():
+        raise WsError(f"找不到路径：{target}")
+    probe = target if target.is_dir() else target.parent
+    entries = parse_worktree_entries(probe)
+    main_repo = entries[0]["path"]
+    if main_repo == HUB_ROOT:
+        raise WsError(
+            "当前目录为工作流母仓（agent-harness），母仓自身不使用业务并行开发线。\n"
+            "请传入目标业务项目路径，例如：`ws line new 01-feat ~/code/<project> --slice design/slices/01-feat.md`。"
+        )
+    if not (main_repo / "AGENTS.md").is_file():
+        raise WsError(f"在主仓库 {main_repo} 未找到 AGENTS.md，请先运行 `ws init`。")
+    common_git_dir = resolve_git_dir(main_repo)
+    if common_git_dir is None:
+        raise WsError(f"无法解析主仓库 {main_repo} 的 .git 目录。")
+    return main_repo, common_git_dir, entries
+
+
+def git_branch_exists(repo: Path, branch: str) -> bool:
+    if not branch:
+        return False
+    res = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=str(repo),
+        capture_output=True,
+    )
+    return res.returncode == 0
+
+
+def read_lines_registry(common_git_dir: Path, main_repo: Path, entries: list[dict]) -> dict[str, dict]:
+    state_path = common_git_dir / LINES_STATE_FILE
+    if not state_path.is_file():
+        return {}
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    raw_lines = data.get("lines") if isinstance(data, dict) else None
+    if not isinstance(raw_lines, dict):
+        return {}
+    wt_paths = {str(e["path"]) for e in entries[1:]}
+    cleaned: dict[str, dict] = {}
+    for name, meta in raw_lines.items():
+        if not isinstance(name, str) or not isinstance(meta, dict):
+            continue
+        branch = str(meta.get("branch") or f"line/{name}")
+        path_str = str(meta.get("path") or "")
+        if path_str in wt_paths or git_branch_exists(main_repo, branch):
+            cleaned[name] = meta
+    return cleaned
+
+
+def write_lines_registry(common_git_dir: Path, reg: dict[str, dict]):
+    state_path = common_git_dir / LINES_STATE_FILE
+    state_path.write_text(json.dumps({"lines": reg}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def normalize_scopes(raw_scopes: list[str] | None) -> list[str]:
+    if not raw_scopes:
+        return []
+    out: list[str] = []
+    for raw in raw_scopes:
+        val = raw.strip().replace("\\", "/").lstrip("./").rstrip("/")
+        if not val:
+            continue
+        if ".." in Path(val).parts:
+            raise WsError(f"无效的 --scope 路径（禁止包含 `..`）：{raw}")
+        if val not in out:
+            out.append(val)
+    return out
+
+
+def scopes_overlap(a: str, b: str) -> bool:
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+
+def line_name_from_entry(entry: dict, reg: dict[str, dict]) -> str:
+    wt_str = str(entry["path"])
+    for name, meta in reg.items():
+        if str(meta.get("path", "")) == wt_str or meta.get("branch") == entry["branch"]:
+            return name
+    branch = entry["branch"]
+    if branch.startswith("line/"):
+        return branch[len("line/"):]
+    return entry["path"].name
+
+
+def read_agents_mode_of(proj: Path) -> str:
+    agents_file = proj / "AGENTS.md"
+    if not agents_file.is_file():
+        return "design"
+    m = MODE_LINE_RE.search(agents_file.read_text(encoding="utf-8", errors="replace"))
+    return m.group(2).lower() if m else "design"
+
+
+def collect_line_touched_files(main_repo: Path, base_branch: str, wt_path: Path | None, branch: str) -> set[str]:
+    touched: set[str] = set()
+    if branch and git_branch_exists(main_repo, base_branch) and git_branch_exists(main_repo, branch):
+        diff_res = subprocess.run(
+            ["git", "diff", "--name-only", "-z", f"{base_branch}...{branch}"],
+            cwd=str(main_repo),
+            capture_output=True,
+        )
+        if diff_res.returncode == 0:
+            for raw in diff_res.stdout.split(b"\0"):
+                if raw:
+                    touched.add(os.fsdecode(raw))
+    if wt_path and wt_path.is_dir():
+        st_res = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=str(wt_path),
+            capture_output=True,
+        )
+        if st_res.returncode == 0:
+            fields = st_res.stdout.split(b"\0")
+            idx = 0
+            while idx < len(fields):
+                item = fields[idx]
+                idx += 1
+                if len(item) < 4:
+                    continue
+                touched.add(os.fsdecode(item[3:]))
+                if item[:1] in (b"R", b"C") and idx < len(fields):
+                    if item[:1] == b"R":
+                        touched.add(os.fsdecode(fields[idx]))
+                    idx += 1
+    return touched
+
+
+def guard_custom_line_script(main_repo: Path, subcmd: str):
+    """若下游项目自带专属可执行 scripts/line（如带容器/数据卷编排），引导优先调用项目脚本，防状态撕裂。"""
+    custom_line = main_repo / "scripts" / "line"
+    if not (custom_line.is_file() and os.access(custom_line, os.X_OK)):
+        return
+    try:
+        head_txt = custom_line.read_text(encoding="utf-8", errors="replace")[:4096]
+    except OSError:
+        head_txt = ""
+    if "ws-line-delegate" in head_txt:
+        return
+    raise WsError(
+        f"检测到项目 ({main_repo.name}) 自带专属开发线脚本 `{custom_line}`（含项目专属环境/数据/沉淀门禁）。\n"
+        f"请直接运行 `./scripts/line {subcmd}`，避免绕过项目专属编排。"
+    )
+
+
+def detect_in_progress_git_op(wt_path: Path | None) -> str:
+    if not wt_path or not wt_path.is_dir():
+        return ""
+    wt_git = resolve_git_dir(wt_path)
+    if not wt_git:
+        return ""
+    for marker in GIT_IN_PROGRESS_MARKERS:
+        if (wt_git / marker).exists():
+            return marker
+    return ""
+
+
+def is_safe_ignored_relpath(rel_posix: str) -> bool:
+    if rel_posix in HARNESS_MANAGED_LOCAL_FILES:
+        return True
+    if any(part in SAFE_IGNORED_CACHE_NAMES for part in Path(rel_posix).parts):
+        return True
+    return rel_posix.endswith((".pyc", ".pyo", ".tsbuildinfo"))
+
+
+def find_precious_ignored_files(wt_path: Path) -> list[str]:
+    """查找工作树内被 .gitignore 忽略、既非软链接也非标准构建/测试缓存的本地独有文件（失败闭锁防误删）。"""
+    res = subprocess.run(
+        ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
+        cwd=str(wt_path),
+        capture_output=True,
+    )
+    if res.returncode != 0:
+        err_msg = res.stderr.decode("utf-8", errors="replace").strip()
+        raise WsError(f"无法扫描工作树 ({wt_path}) 的本地忽略文件状态（已中止删除防数据丢失）：{err_msg}")
+
+    precious: list[str] = []
+    for raw in res.stdout.split(b"\0"):
+        if not raw:
+            continue
+        rel = os.fsdecode(raw)
+        clean = rel.rstrip("/")
+        if not clean or is_safe_ignored_relpath(clean):
+            continue
+        full = wt_path / clean
+        if full.is_symlink():
+            continue
+        if full.is_dir():
+            for dirpath, dirnames, filenames in os.walk(full, followlinks=False):
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in SAFE_IGNORED_CACHE_NAMES and not os.path.islink(os.path.join(dirpath, d))
+                ]
+                for fname in filenames:
+                    fpath = Path(dirpath) / fname
+                    if fpath.is_symlink():
+                        continue
+                    frel = fpath.relative_to(wt_path).as_posix()
+                    if is_safe_ignored_relpath(frel):
+                        continue
+                    precious.append(frel)
+        elif full.exists():
+            precious.append(clean)
+    return sorted(set(precious))
+
+
+def dry_run_merge_conflict(main_repo: Path, common_git_dir: Path, base_ref: str, head_ref: str) -> bool:
+    """在不污染主对象库的前提下预演合并冲突；自动兼容 Git >= 2.38 与旧版 Git。"""
+    with tempfile.TemporaryDirectory(prefix="ws-mt-") as tmp_obj:
+        orig_obj = str((common_git_dir / "objects").resolve())
+        prev_alt = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES", "")
+        mt_env = {
+            **os.environ,
+            "GIT_OBJECT_DIRECTORY": tmp_obj,
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": f"{orig_obj}{os.pathsep}{prev_alt}" if prev_alt else orig_obj,
+        }
+        mt = subprocess.run(
+            ["git", "merge-tree", "--write-tree", base_ref, head_ref],
+            cwd=str(main_repo),
+            capture_output=True,
+            env=mt_env,
+        )
+        if mt.returncode == 0:
+            return False
+        if mt.returncode == 1:
+            return True
+
+    mb = subprocess.run(
+        ["git", "merge-base", base_ref, head_ref],
+        cwd=str(main_repo),
+        capture_output=True,
+        text=True,
+    )
+    if mb.returncode != 0 or not mb.stdout.strip():
+        return True
+    classic = subprocess.run(
+        ["git", "merge-tree", mb.stdout.strip(), base_ref, head_ref],
+        cwd=str(main_repo),
+        capture_output=True,
+    )
+    return classic.returncode != 0 or b"\n+<<<<<<< " in classic.stdout or classic.stdout.startswith(b"+<<<<<<< ")
+
+
+def cmd_line_new(args):
+    name = args.name.strip()
+    if not LINE_NAME_RE.match(name) or name.lower() in RESERVED_LINE_NAMES:
+        raise WsError(
+            f"不合法的开发线名称 `{name}`：请使用字母、数字、`-`、`_` 或 `.`（不可使用 main/master 等保留名）。"
+        )
+    scopes = normalize_scopes(args.scope)
+    main_repo, common_git_dir, entries = resolve_line_context(args.project_dir)
+    guard_custom_line_script(main_repo, "new")
+
+    head_chk = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=str(main_repo), capture_output=True)
+    if head_chk.returncode != 0:
+        raise WsError(
+            f"主仓库 ({main_repo}) 尚无初始提交（No commits yet），Git 无法创建并行工作树。\n"
+            "请先在主目录完成首片地基（如 Slice 00）并提交基线（git add & git commit），切回 `ws mode design` 后再执行 `ws line new`。"
+        )
+
+    base_branch = entries[0]["branch"]
+    if not base_branch:
+        raise WsError(f"主仓库 ({main_repo}) 当前处于游离 HEAD 状态，请先切回主分支（如 main）后再开线。")
+
+    with acquire_line_lock(common_git_dir):
+        entries = parse_worktree_entries(main_repo)
+        reg = read_lines_registry(common_git_dir, main_repo, entries)
+        branch_name = f"line/{name}"
+        wt_path = (main_repo.parent / f"{main_repo.name}-lines" / name).resolve()
+
+        if (
+            name in reg
+            or wt_path.exists()
+            or git_branch_exists(main_repo, branch_name)
+            or any(e["path"] == wt_path for e in entries[1:])
+        ):
+            raise WsError(
+                f"开发线 `{name}`（分支 `{branch_name}` 或目录 `{wt_path}`）已存在。\n"
+                f"可运行 `ws line list` 查看状态，或用 `ws line rm {name}` 清理后再建。"
+            )
+
+        if scopes and not args.allow_overlap:
+            for other_name, meta in reg.items():
+                other_scopes = meta.get("scopes") or []
+                for s_new in scopes:
+                    for s_old in other_scopes:
+                        if scopes_overlap(s_new, s_old):
+                            raise WsError(
+                                f"模块独占写范围冲突：新线 `{name}` 声明的 `{s_new}` 与在跑开发线 `{other_name}` 的 `{s_old}` 重叠。\n"
+                                f"请等待 `{other_name}` 合入后再开，或确认修改文件互不重叠时显式添加 `--allow-overlap`。"
+                            )
+
+        used_slots = {int(m["slot"]) for m in reg.values() if str(m.get("slot", "")).isdigit()}
+        slot = 1
+        while slot in used_slots:
+            slot += 1
+
+        wt_path.parent.mkdir(parents=True, exist_ok=True)
+        add_res = subprocess.run(
+            ["git", "worktree", "add", "-b", branch_name, str(wt_path), base_branch],
+            cwd=str(main_repo),
+            capture_output=True,
+            text=True,
+        )
+        if add_res.returncode != 0:
+            raise WsError(f"创建 Git 工作树失败：{add_res.stderr.strip() or add_res.stdout.strip()}")
+
+        linked, shared = wire_worktree_harness(main_repo, wt_path)
+
+        wt_git_dir = resolve_git_dir(wt_path)
+        if wt_git_dir is None:
+            raise WsError(f"无法解析新工作树 {wt_path} 的 Git 目录。")
+        target_mode = args.mode or "build"
+        mode_payload: dict[str, str] = {"mode": target_mode}
+        if args.slice:
+            mode_payload["slice"] = str(args.slice)
+        (wt_git_dir / LOCAL_MODE_STATE_FILE).write_text(
+            json.dumps(mode_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        reg[name] = {
+            "branch": branch_name,
+            "path": str(wt_path),
+            "base": base_branch,
+            "slice": args.slice or "",
+            "scopes": scopes,
+            "allow_overlap": bool(args.allow_overlap),
+            "slot": slot,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        write_lines_registry(common_git_dir, reg)
+
+    slice_note = f"，Active-Slice: {args.slice}" if args.slice else ""
+    scope_note = f"\n  - 独占范围：{', '.join(scopes)}" if scopes else ""
+    shared_note = f"；已软链本地配置：{', '.join(shared)}" if shared else ""
+    print(f"[{main_repo.name}] 已开启并行开发线 `{name}`（槽位 #{slot}）")
+    print(f"  - 工作树目录：{wt_path}（分支 `{branch_name}`，基线 `{base_branch}`）")
+    print(f"  - 本地门禁：Mode: {target_mode}{slice_note}（主仓 AGENTS.md 保持 Mode: {read_agents_mode_of(main_repo)} 零改动）{scope_note}")
+    print(f"  - 环境就绪：已挂载技能 ({len(linked)}) 与三端门禁钩子{shared_note}")
+    print(f"  - 下一步：在该目录开启独立会话开发并 git commit，验收后运行 `ws line sync` 过检合入 `{base_branch}`。")
+    return 0
+
+
+def cmd_line_list(args):
+    main_repo, common_git_dir, entries = resolve_line_context(args.project_dir)
+    reg = read_lines_registry(common_git_dir, main_repo, entries)
+    base_branch = entries[0]["branch"] or "main"
+    main_mode = read_agents_mode_of(main_repo)
+
+    if len(entries) <= 1:
+        print(f"[{main_repo.name}] 当前无活跃并行开发线（主目录 `{base_branch}` -> Mode: {main_mode}）。")
+        return 0
+
+    print(f"[{main_repo.name}] 主目录：{main_repo}（分支 `{base_branch}`，Mode: {main_mode}）")
+    print(f"活跃并行工作树（共 {len(entries) - 1} 条）：")
+    for entry in entries[1:]:
+        wt_path = entry["path"]
+        name = line_name_from_entry(entry, reg)
+        meta = reg.get(name, {})
+        branch = entry["branch"] or "(detached)"
+        local_st = read_local_mode_state(wt_path)
+        eff_mode = local_st["mode"] if local_st else read_agents_mode_of(wt_path)
+        eff_slice = (local_st or {}).get("slice") or meta.get("slice") or ""
+        in_prog = detect_in_progress_git_op(wt_path)
+        dirty = bool(
+            subprocess.run(["git", "status", "--porcelain"], cwd=str(wt_path), capture_output=True, text=True)
+            .stdout.strip()
+        ) if wt_path.is_dir() else False
+        ahead_behind = ""
+        eff_base = str(meta.get("base") or base_branch)
+        if not entry["detached"] and git_branch_exists(main_repo, eff_base) and git_branch_exists(main_repo, branch):
+            ab = subprocess.run(
+                ["git", "rev-list", "--left-right", "--count", f"{eff_base}...{branch}"],
+                cwd=str(main_repo),
+                capture_output=True,
+                text=True,
+            )
+            if ab.returncode == 0 and len(ab.stdout.split()) == 2:
+                behind_n, ahead_n = ab.stdout.split()
+                ahead_behind = f"+{ahead_n}/-{behind_n}"
+        slot_str = f"#{meta['slot']} " if meta.get("slot") else ""
+        slice_str = f" | slice={eff_slice}" if eff_slice else ""
+        scopes = meta.get("scopes") or []
+        scope_str = f" | scope={','.join(scopes)}" if scopes else ""
+        state_str = f"未完成{in_prog}" if in_prog else ("有未提交改动" if dirty else "工作区干净")
+        ab_str = f" | 相对 {eff_base} {ahead_behind}" if ahead_behind else ""
+        print(f"  - {slot_str}{name} [{branch}] Mode:{eff_mode} ({state_str}{ab_str}{slice_str}{scope_str})")
+        print(f"    {wt_path}")
+    return 0
+
+
+def cmd_line_check(args):
+    main_repo, common_git_dir, entries = resolve_line_context(args.project_dir)
+    guard_custom_line_script(main_repo, "check")
+    reg = read_lines_registry(common_git_dir, main_repo, entries)
+    base_branch = entries[0]["branch"] or "main"
+
+    failed = False
+    active_items: list[tuple[str, Path, str, str, dict, set[str]]] = []
+    for entry in entries[1:]:
+        wt_path = entry["path"]
+        name = line_name_from_entry(entry, reg)
+        meta = reg.get(name, {})
+        in_prog = detect_in_progress_git_op(wt_path)
+        if entry["detached"] and not in_prog and name not in reg:
+            continue  # 跳过与开发线无关的纯历史只读快照检出（如验收用的 detached HEAD~1）
+        if not (wt_path / "AGENTS.md").is_file() and not in_prog:
+            continue
+        if in_prog:
+            failed = True
+            print(f"  [冲突] 开发线 `{name}` ({wt_path}) 正处于未完成的 Git 操作（{in_prog}），请先解决或中止。", file=sys.stderr)
+        elif entry["detached"]:
+            failed = True
+            print(f"  [冲突] 开发线 `{name}` ({wt_path}) 处于游离 HEAD 状态，请切回对应 `line/` 分支。", file=sys.stderr)
+        branch = entry["branch"]
+        head_ref = branch or entry["head"]
+        line_base = str(meta.get("base") or base_branch)
+        touched = collect_line_touched_files(main_repo, line_base, wt_path, branch)
+        active_items.append((name, wt_path, branch, head_ref, meta, touched))
+
+    if not active_items:
+        print(f"[{main_repo.name}] 当前无活跃并行开发线，无需碰撞检查。")
+        return 0
+
+    # 1) 检查单线越出声明范围及未豁免的声明范围冲突
+    for idx, (name_a, _, _, _, meta_a, touched_a) in enumerate(active_items):
+        scopes_a = meta_a.get("scopes") or []
+        if scopes_a:
+            outside = sorted(
+                f for f in touched_a
+                if not f.startswith(("design/", "docs/"))
+                and f != "AGENTS.md"
+                and not any(scopes_overlap(f, sc) for sc in scopes_a)
+            )
+            if outside:
+                sample = ", ".join(outside[:5]) + (" ..." if len(outside) > 5 else "")
+                print(f"  [提示] 开发线 `{name_a}` 改动了声明范围 ({', '.join(scopes_a)}) 之外的文件：{sample}")
+        for name_b, _, _, _, meta_b, _ in active_items[idx + 1:]:
+            scopes_b = meta_b.get("scopes") or []
+            if not scopes_a or not scopes_b:
+                continue
+            if meta_a.get("allow_overlap") or meta_b.get("allow_overlap"):
+                continue
+            for sa in scopes_a:
+                for sb in scopes_b:
+                    if scopes_overlap(sa, sb):
+                        failed = True
+                        print(
+                            f"  [冲突] 声明范围重叠：`{name_a}` ({sa}) 与 `{name_b}` ({sb})",
+                            file=sys.stderr,
+                        )
+
+    # 2) 检查多条并行线实际触碰同一文件（硬阻断）
+    for idx, (name_a, _, _, _, _, touched_a) in enumerate(active_items):
+        for name_b, _, _, _, _, touched_b in active_items[idx + 1:]:
+            overlap_files = sorted(touched_a & touched_b)
+            if overlap_files:
+                failed = True
+                sample = ", ".join(overlap_files[:8]) + (f" 等 {len(overlap_files)} 个文件" if len(overlap_files) > 8 else "")
+                print(f"  [冲突] 开发线 `{name_a}` 与 `{name_b}` 同时修改了相同文件：{sample}", file=sys.stderr)
+
+    # 3) 预演与基线分支的已提交合并冲突 + 工作区未提交改动与已推进基线的文件交集
+    for name, wt_path, branch, head_ref, meta, touched in active_items:
+        line_base = str(meta.get("base") or base_branch)
+        if not head_ref or not git_branch_exists(main_repo, line_base):
+            continue
+        if branch and dry_run_merge_conflict(main_repo, common_git_dir, line_base, branch):
+            failed = True
+            print(f"  [冲突] 开发线 `{name}` ({branch}) 与当前 `{line_base}` 预合并存在代码冲突，需先变基解决。", file=sys.stderr)
+            continue
+        # 检查该线尚未提交的工作区改动是否与已推进的基线改动撞在同一文件
+        mb = subprocess.run(["git", "merge-base", line_base, head_ref], cwd=str(main_repo), capture_output=True, text=True)
+        if mb.returncode == 0 and mb.stdout.strip():
+            base_adv = subprocess.run(
+                ["git", "diff", "--name-only", "-z", f"{mb.stdout.strip()}..{line_base}"],
+                cwd=str(main_repo),
+                capture_output=True,
+            )
+            if base_adv.returncode == 0:
+                base_changed = {os.fsdecode(r) for r in base_adv.stdout.split(b"\0") if r}
+                wt_uncommitted = collect_line_touched_files(main_repo, "", wt_path, "")
+                wt_base_hit = sorted(wt_uncommitted & base_changed)
+                if wt_base_hit:
+                    failed = True
+                    print(
+                        f"  [冲突] 开发线 `{name}` 的未提交改动与已推进的 `{line_base}` 修改了相同文件：{', '.join(wt_base_hit[:6])}",
+                        file=sys.stderr,
+                    )
+
+    if failed:
+        return 1
+    print(f"[{main_repo.name}] 并行开发线正交检查通过（活跃开发线 {len(active_items)} 条，零文件碰撞与合并冲突）。")
+    return 0
+
+
+def resolve_sync_target(target_arg: str, project_arg: str) -> tuple[Path, Path, list[dict], str, Path, str, dict]:
+    if target_arg:
+        cand = Path(target_arg).expanduser()
+        # 仅当 target_arg 明确指向某条关联并行工作树目录时按路径解析（避免与主仓内 api/web 等同名子目录撞名）
+        if cand.is_dir():
+            try:
+                main_repo, common_git_dir, entries = resolve_line_context(cand)
+                reg = read_lines_registry(common_git_dir, main_repo, entries)
+                cand_res = cand.resolve()
+                for entry in entries[1:]:
+                    if cand_res == entry["path"] or entry["path"] in cand_res.parents:
+                        name = line_name_from_entry(entry, reg)
+                        return main_repo, common_git_dir, entries, name, entry["path"], entry["branch"], reg.get(name, {})
+            except WsError:
+                pass
+
+        main_repo, common_git_dir, entries = resolve_line_context(project_arg)
+        reg = read_lines_registry(common_git_dir, main_repo, entries)
+        for entry in entries[1:]:
+            name = line_name_from_entry(entry, reg)
+            if target_arg in (name, entry["branch"], entry["path"].name):
+                return main_repo, common_git_dir, entries, name, entry["path"], entry["branch"], reg.get(name, {})
+        raise WsError(f"未找到活跃开发线 `{target_arg}`，可运行 `ws line list` 查看当前开发线。")
+
+    cwd_res = Path(os.getcwd()).resolve()
+    main_repo, common_git_dir, entries = resolve_line_context(project_arg or cwd_res)
+    reg = read_lines_registry(common_git_dir, main_repo, entries)
+    for entry in entries[1:]:
+        if cwd_res == entry["path"] or entry["path"] in cwd_res.parents:
+            name = line_name_from_entry(entry, reg)
+            return main_repo, common_git_dir, entries, name, entry["path"], entry["branch"], reg.get(name, {})
+    raise WsError("当前位于主仓库目录；请进入开发线工作树运行 `ws line sync`，或指定线名：`ws line sync <name>`。")
+
+
+def cmd_line_sync(args):
+    main_repo, common_git_dir, _, line_name, wt_path, branch_name, meta = resolve_sync_target(
+        args.target, args.project_dir
+    )
+    guard_custom_line_script(main_repo, "sync")
+
+    in_prog = detect_in_progress_git_op(wt_path)
+    if in_prog:
+        raise WsError(
+            f"开发线 `{line_name}` ({wt_path}) 正处于未完成的 Git 操作（{in_prog}）。\n"
+            "请先在该工作树解决冲突执行 `git rebase --continue`（或 `git rebase --abort` 放弃）后再运行 `ws line sync`。"
+        )
+    if not branch_name:
+        raise WsError(f"开发线 `{line_name}` 当前处于游离 HEAD 状态，无法自动合入。")
+
+    with acquire_line_lock(common_git_dir):
+        entries = parse_worktree_entries(main_repo)
+        base_branch = str(meta.get("base") or entries[0]["branch"] or "main")
+
+        if entries[0]["branch"] != base_branch:
+            raise WsError(
+                f"主仓库 ({main_repo}) 当前不在基线分支 `{base_branch}` 上（当前：`{entries[0]['branch'] or 'detached'}`），请先切回 `{base_branch}`。"
+            )
+        main_dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=str(main_repo),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if main_dirty:
+            raise WsError(
+                f"主仓库 ({main_repo}) 存在未提交的已跟踪改动；主目录仅用于设计与合流，请先清理或提交主目录改动。"
+            )
+
+        wt_dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(wt_path),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if wt_dirty:
+            raise WsError(f"开发线 `{line_name}` ({wt_path}) 存在未提交的改动，请先完成 `git commit` 后再运行 `ws line sync`。")
+
+        anc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base_branch, "HEAD"],
+            cwd=str(wt_path),
+            capture_output=True,
+        )
+        if anc.returncode != 0:
+            print(f"[{line_name}] 正在变基跟上最新 `{base_branch}` ...")
+            rb = subprocess.run(["git", "rebase", base_branch], cwd=str(wt_path), capture_output=True, text=True)
+            if rb.returncode != 0:
+                conflicts = subprocess.run(
+                    ["git", "diff", "--name-only", "--diff-filter=U"],
+                    cwd=str(wt_path),
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                conflict_list = "\n".join(f"  - {c}" for c in conflicts.splitlines()) if conflicts else f"  {rb.stderr.strip()}"
+                raise WsError(
+                    f"开发线 `{line_name}` 变基至 `{base_branch}` 时发生冲突：\n{conflict_list}\n"
+                    f"处理：在 {wt_path} 解决冲突后运行 `git add <文件> && git rebase --continue`，再重跑 `ws line sync`；"
+                    "若需中止本次变基，运行 `git rebase --abort`。"
+                )
+
+        ahead_out = subprocess.run(
+            ["git", "rev-list", "--count", f"{base_branch}..HEAD"],
+            cwd=str(wt_path),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        ahead = int(ahead_out or "0")
+        if ahead == 0:
+            print(f"[{line_name}] 当前没有待合入 `{base_branch}` 的新提交（已同步最新基线）。")
+            return 0
+
+        # 密钥红线不可豁免：即使传入 --skip-check，仍强制扫描 base_branch..HEAD 全部提交是否含泄漏密钥
+        sec_res = subprocess.run(
+            [sys.executable, str(SECRETS_GUARD), "--worktree", "--base", base_branch, "--cwd", str(wt_path)],
+            cwd=str(wt_path),
+        )
+        if sec_res.returncode != 0:
+            raise WsError(f"开发线 `{line_name}` 提交区间包含疑似密钥泄露，已阻断合入 `{base_branch}`。")
+
+        if not args.skip_check:
+            chk_env = {**os.environ, "WS_CHECK_BASE": base_branch}
+            proj_check = wt_path / "scripts" / "check"
+            if proj_check.is_file() and os.access(proj_check, os.X_OK):
+                print(f"[{line_name}] 正在执行项目全量门禁 ./scripts/check (WS_CHECK_BASE={base_branch}) ...")
+                chk_res = subprocess.run([str(proj_check)], cwd=str(wt_path), env=chk_env).returncode
+            else:
+                print(f"[{line_name}] 正在执行母仓质量与安全门禁 ws check --base {base_branch} ...")
+                chk_res = run_ws_check_on(wt_path, diff=False, base_ref=base_branch)
+            if chk_res != 0:
+                raise WsError(f"开发线 `{line_name}` 门禁检查未通过，已阻断合入 `{base_branch}`。请在该开发线修复提交后重试。")
+
+            post_dirty = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(wt_path),
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if post_dirty:
+                raise WsError(
+                    f"门禁脚本运行后工作树 ({wt_path}) 产生了未提交改动（如新生成的接口契约），请先提交后再运行 `ws line sync`。"
+                )
+
+        anc_after = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base_branch, "HEAD"],
+            cwd=str(wt_path),
+            capture_output=True,
+        )
+        if anc_after.returncode != 0:
+            raise WsError(f"门禁检查期间 `{base_branch}` 有新提交合入，请重新运行一次 `ws line sync`。")
+
+        ff = subprocess.run(
+            ["git", "merge", "--ff-only", branch_name],
+            cwd=str(main_repo),
+            capture_output=True,
+            text=True,
+        )
+        if ff.returncode != 0:
+            raise WsError(f"快进合入 `{base_branch}` 失败：{ff.stderr.strip() or ff.stdout.strip()}")
+
+        print(f"[{line_name}] 已通过门禁并快进合入 `{base_branch}`（共 {ahead} 个提交）。")
+        print(f"  - 若本开发线已交付完结，可在主目录运行 `ws line rm {line_name}` 收线清理。")
+    return 0
+
+
+def cmd_line_rm(args):
+    raw_name = args.name.strip()
+    main_repo, common_git_dir, entries = resolve_line_context(args.project_dir)
+    guard_custom_line_script(main_repo, "rm")
+
+    with acquire_line_lock(common_git_dir):
+        entries = parse_worktree_entries(main_repo)
+        reg = read_lines_registry(common_git_dir, main_repo, entries)
+
+        canonical_name = raw_name[len("line/"):] if raw_name.startswith("line/") else raw_name
+        meta = reg.get(canonical_name, {})
+        branch_name = str(meta.get("branch") or f"line/{canonical_name}")
+        wt_path: Path | None = None
+        wt_entry: dict | None = None
+        for entry in entries[1:]:
+            e_name = line_name_from_entry(entry, reg)
+            if raw_name in (e_name, entry["branch"], entry["path"].name) or canonical_name == e_name:
+                canonical_name = e_name
+                meta = reg.get(canonical_name, meta)
+                wt_path = entry["path"]
+                wt_entry = entry
+                if entry["branch"]:
+                    branch_name = entry["branch"]
+                elif meta.get("branch"):
+                    branch_name = str(meta["branch"])
+                break
+        if wt_path is None and meta.get("path"):
+            cand_wt = Path(str(meta["path"])).resolve()
+            if cand_wt != main_repo and cand_wt.exists():
+                wt_path = cand_wt
+
+        base_branch = str(meta.get("base") or entries[0]["branch"] or "main")
+        branch_short = branch_name.removeprefix("refs/heads/")
+        if branch_short == base_branch or branch_short.lower() in RESERVED_LINE_NAMES or canonical_name.lower() in RESERVED_LINE_NAMES:
+            raise WsError(f"禁止通过 `ws line rm` 删除主分支或保留分支 `{branch_short}`。")
+
+        has_branch = git_branch_exists(main_repo, branch_name)
+        if wt_path is None and not has_branch and canonical_name not in reg:
+            raise WsError(f"未找到开发线 `{raw_name}`（可运行 `ws line list` 核对名称）。")
+        if wt_path == main_repo:
+            raise WsError("禁止对主仓库执行 `ws line rm`。")
+
+        cwd_res = Path(os.getcwd()).resolve()
+        if wt_path and (cwd_res == wt_path or wt_path in cwd_res.parents):
+            raise WsError(f"当前终端正位于待收掉的开发线目录 ({wt_path}) 内，请先切回主目录 ({main_repo}) 再执行 `ws line rm {canonical_name}`。")
+
+        problems: list[str] = []
+        if wt_path and wt_path.is_dir():
+            registered_wts = {e["path"] for e in entries[1:]}
+            if wt_path not in registered_wts:
+                raise WsError(f"目录 {wt_path} 不在当前仓库的 Git 工作树列表中，为防误删已中止。")
+            in_prog = detect_in_progress_git_op(wt_path)
+            if in_prog:
+                problems.append(f"工作树正处于未完成的 Git 操作（{in_prog}，如变基冲突中断）")
+            st_res = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(wt_path),
+                capture_output=True,
+                text=True,
+            )
+            if st_res.returncode != 0 or st_res.stdout.strip():
+                problems.append(f"工作树存在未提交的改动（`git -C {wt_path} status`）")
+            precious = find_precious_ignored_files(wt_path)
+            if precious:
+                sample = ", ".join(precious[:6]) + (f" 等 {len(precious)} 项" if len(precious) > 6 else "")
+                problems.append(f"工作树内存在仅保存在本地的忽略文件（防误删）：{sample}")
+
+        # 失败闭锁核查未合并提交：基线不存在或统计失败时，无 --discard 一律拒绝删除
+        refs_to_verify: list[str] = []
+        if has_branch:
+            refs_to_verify.append(branch_name)
+        if wt_entry and wt_entry.get("detached") and wt_entry.get("head"):
+            refs_to_verify.append(str(wt_entry["head"]))
+
+        if refs_to_verify:
+            if not git_branch_exists(main_repo, base_branch):
+                problems.append(f"找不到基线分支 `{base_branch}`，无法核实提交是否已合入")
+            else:
+                for ref in refs_to_verify:
+                    unmerged_out = subprocess.run(
+                        ["git", "rev-list", "--count", f"{base_branch}..{ref}"],
+                        cwd=str(main_repo),
+                        capture_output=True,
+                        text=True,
+                    )
+                    if unmerged_out.returncode != 0:
+                        problems.append(f"无法核实 `{ref}` 相对 `{base_branch}` 的未合入提交数")
+                    else:
+                        unmerged = int(unmerged_out.stdout.strip() or "0")
+                        if unmerged > 0:
+                            label = f"游离提交 `{ref[:8]}`" if wt_entry and ref == wt_entry.get("head") else f"分支 `{ref}`"
+                            problems.append(f"{label} 仍有 {unmerged} 个提交未合入 `{base_branch}`（请先合入或确认丢弃）")
+
+        if problems and not args.discard:
+            detail = "\n".join(f"  - {p}" for p in problems)
+            raise WsError(
+                f"拒绝收掉开发线 `{canonical_name}`：\n{detail}\n"
+                "处理：先合入提交并迁出需保留的本地文件；若确认全部丢弃，请显式追加 `--discard`。"
+            )
+
+        if wt_path and wt_path.exists():
+            rm_res = subprocess.run(
+                ["git", "worktree", "remove", "--force", str(wt_path)],
+                cwd=str(main_repo),
+                capture_output=True,
+                text=True,
+            )
+            if rm_res.returncode != 0:
+                raise WsError(f"移除工作树失败：{rm_res.stderr.strip() or rm_res.stdout.strip()}")
+            lines_parent = wt_path.parent
+            if lines_parent.name == f"{main_repo.name}-lines":
+                try:
+                    if not any(lines_parent.iterdir()):
+                        lines_parent.rmdir()
+                except OSError:
+                    pass
+
+        subprocess.run(["git", "worktree", "prune"], cwd=str(main_repo), capture_output=True)
+        if has_branch:
+            del_br = subprocess.run(
+                ["git", "branch", "-D", branch_name],
+                cwd=str(main_repo),
+                capture_output=True,
+                text=True,
+            )
+            if del_br.returncode != 0:
+                raise WsError(f"删除分支 `{branch_name}` 失败：{del_br.stderr.strip() or del_br.stdout.strip()}")
+        if canonical_name in reg:
+            del reg[canonical_name]
+            write_lines_registry(common_git_dir, reg)
+
+    print(f"[{main_repo.name}] 已收掉开发线 `{canonical_name}`（工作树与分支 `{branch_name}` 已清理完毕）。")
+    return 0
+
+
+def worktree_note(count: int) -> str:
+    return f"，并行工作树 {count} 条" if count else ""
+
+
+def cmd_link(args):
+    targets = iter_target_projects(args.project_dir)
+    if not targets:
+        print("当前没有已注册的业务项目。用法：`ws init <项目目录>` 或 `ws link <项目目录>`。")
+        return 0
+    failed = False
+    for proj in targets:
+        try:
+            linked = link_skills(proj)
+            trees = 0
+            if proj != HUB_ROOT:
+                sync_prototype_runtime(proj)
+                ensure_claude_bridge(proj)
+                write_hooks(proj)
+                ensure_gitignore(proj, linked)
+                register_project(proj)
+                trees = link_worktrees(proj)
+        except WsError as exc:
+            failed = True
+            print(f"[{proj.name}] 错误：{exc}", file=sys.stderr)
+            continue
+        print(f"[{proj.name}] 软链接、原型胶囊与三端钩子已重连（技能: {len(linked)} 个{worktree_note(trees)}）")
+    return 1 if failed else 0
+
+
+def cmd_sync(args):
+    targets = iter_target_projects(args.project_dir)
+    if not targets:
+        print("当前没有已注册的业务项目可同步。")
+        return 0
+    failed = False
+    for proj in targets:
+        try:
+            linked = link_skills(proj)
+            status = "hub-skipped"
+            trees = 0
+            if proj != HUB_ROOT:
+                status = sync_charter_in_agents(proj)
+                ensure_claude_bridge(proj)
+                sync_prototype_runtime(proj)
+                write_hooks(proj)
+                ensure_gitignore(proj, linked)
+                trees = link_worktrees(proj)
+        except WsError as exc:
+            failed = True
+            print(f"[{proj.name}] 错误：{exc}", file=sys.stderr)
+            continue
+        print(f"[{proj.name}] 同步完成：AGENTS.md={status}, 技能={len(linked)} 个{worktree_note(trees)}")
+    return 1 if failed else 0
+
+
+def find_promote_conflicts(src: Path, dst: Path) -> list[Path]:
+    """列出迁入时会被覆盖的目标侧已有文件；两侧同为目录时递归合并，不算冲突。"""
+    conflicts: list[Path] = []
+    for item in sorted(src.iterdir()):
+        if item.name == ".DS_Store":
+            continue
+        target = dst / item.name
+        if not (target.exists() or target.is_symlink()):
+            continue
+        if item.is_dir() and target.is_dir() and not (item.is_symlink() or target.is_symlink()):
+            conflicts += find_promote_conflicts(item, target)
+        else:
+            conflicts.append(target)
+    return conflicts
+
+
+def cmd_promote(args):
+    src_idea = get_sandbox_root() / args.idea
+    if not src_idea.is_dir():
+        print(f"错误：未找到沙盒点子目录 {src_idea}", file=sys.stderr)
+        return 1
+
+    dst_proj = Path(args.target_dir).expanduser().resolve()
+    dst_design = dst_proj / "design"
+
+    # 迁入已有仓库时先查同名文件：有冲突就原样中止，绝不静默覆盖目标仓里已有的设计文档
+    managed_overlay = dst_design / "prototype" / "dev-overlay.js"
+    conflicts = [c for c in find_promote_conflicts(src_idea, dst_design) if c != managed_overlay] if dst_design.is_dir() else []
+    if conflicts:
+        print(f"错误：目标仓 {dst_design} 已存在以下同名文件，为避免覆盖已中止（沙盒与目标仓均未改动）：", file=sys.stderr)
+        for c in conflicts:
+            print(f"  - {c.relative_to(dst_proj)}", file=sys.stderr)
+        print("处理：先手工合并或改名其中一侧，再重新运行 `ws promote`。", file=sys.stderr)
+        return 1
+
+    init_ns = argparse.Namespace(project_dir=str(dst_proj), name=args.name or args.idea, mode="design")
+    rc = cmd_init(init_ns)
+    if rc != 0:
+        return rc
+
+    moved = []
+    for item in sorted(src_idea.iterdir()):
+        if item.name == ".DS_Store":
+            item.unlink()
+            continue
+        target_path = dst_design / item.name
+        if target_path.exists() and item.is_dir():
+            shutil.copytree(item, target_path, dirs_exist_ok=True)
+            shutil.rmtree(item)
+        else:
+            shutil.move(str(item), str(target_path))
+        moved.append(item.name)
+
+    sync_prototype_runtime(dst_proj)
+    shutil.rmtree(src_idea, ignore_errors=True)
+    print(f"已将沙盒点子 `{args.idea}` 毕业迁出至 {dst_proj}/design/（迁移项：{', '.join(moved) or '空骨架'}）")
+    return 0
+
+
+def cmd_map(args):
+    guards_dir = str(HUB_ROOT / "harness" / "guards")
+    if guards_dir not in sys.path:
+        sys.path.insert(0, guards_dir)
+    from code_outline import map_target  # noqa: E402
+
+    try:
+        print(map_target(Path(args.target), max_lines=args.max_lines, max_depth=args.depth))
+        return 0
+    except FileNotFoundError as exc:
+        raise WsError(str(exc)) from exc
+
+
+def cmd_doctor(args):
+    ok = True
+    print("=== 1. 母仓核心组件体检 ===")
+    for label, path in [
+        ("Mode Guard", MODE_GUARD),
+        ("Read Guard", READ_GUARD),
+        ("Code Outline (AST Map)", CODE_OUTLINE),
+        ("Secrets Guard", SECRETS_GUARD),
+        ("Anti-Stub & Boundary Guard", ANTI_STUB_GUARD),
+        ("Prototype Checker", PROTO_CHECKER),
+        ("Prototype Dev Overlay", OVERLAY_RUNTIME),
+        ("Charter Block", CHARTER_FILE),
+    ]:
+        exists = path.is_file()
+        ok = ok and exists
+        print(f"  [{'OK' if exists else 'ERR'}] {label}: {path}")
+
+    ast_grep_bin = shutil.which("ast-grep") or (
+        "/opt/homebrew/bin/ast-grep" if Path("/opt/homebrew/bin/ast-grep").is_file() else None
+    )
+    print(
+        f"  [{'OK' if ast_grep_bin else 'INFO'}] ast-grep (多语言 AST 加速): "
+        f"{ast_grep_bin if ast_grep_bin else '未安装（已启用内置降级扫描；可 brew install ast-grep 提速）'}"
+    )
+    chrome = Path(os.environ.get("CHROME", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+    pw_mod = HUB_ROOT / "harness" / "guards" / "node_modules" / "playwright-core"
+    print(f"  [{'OK' if chrome.exists() else 'WARN'}] Chrome 浏览器: {chrome}")
+    print(f"  [{'OK' if pw_mod.exists() else 'WARN'}] playwright-core: {'已就绪' if pw_mod.exists() else '未安装（在 harness/guards 运行 npm install）'}")
+
+    print("\n=== 2. 本机全局三端 MCP 配置探测（只读不打印密钥）===")
+    home = Path.home()
+    for tool_label, cfg_path in [
+        ("Antigravity (agy)", home / ".gemini" / "config" / "mcp_config.json"),
+        ("Claude Code", home / ".claude.json"),
+        ("OpenAI Codex", home / ".codex" / "config.toml"),
+    ]:
+        try:
+            present_str = "已配置" if cfg_path.is_file() else "未发现"
+        except OSError:
+            present_str = "沙箱隔离跳过"
+        print(f"  [{present_str}] {tool_label}: {cfg_path}")
+
+    proj_arg = args.project_dir
+    if not proj_arg and Path.cwd().resolve() != HUB_ROOT and (Path.cwd() / "AGENTS.md").is_file():
+        proj_arg = str(Path.cwd())
+
+    if proj_arg:
+        proj = Path(proj_arg).expanduser().resolve()
+        print(f"\n=== 3. 业务项目检查：{proj} ===")
+        agents_file = proj / "AGENTS.md"
+        agents_ok = agents_file.is_file() and bool(MODE_LINE_RE.search(agents_file.read_text(encoding="utf-8", errors="replace")))
+        claude_md_ok = (proj / "CLAUDE.md").is_file() and "@AGENTS.md" in (proj / "CLAUDE.md").read_text(encoding="utf-8", errors="replace")
+        claude_skills_path = proj / ".claude" / "skills"
+        claude_link_ok = claude_skills_path.is_symlink()
+        agy_hook_ok = agy_guard_wired(proj / ".agents" / "hooks.json")
+        claude_hook_ok = claude_guard_wired(proj / ".claude" / "settings.local.json")
+        git_hook_ok = active_guard_hook(proj) is not None
+        git_hook_written = any(
+            f.is_file() and GITHOOK_GUARD_MARKER in f.read_text(encoding="utf-8", errors="replace")
+            for f in (proj / ".githooks" / "pre-commit", proj / ".husky" / "pre-commit")
+        )
+        git_hook_unreachable = any(
+            GITHOOK_GUARD_MARKER in txt and not guard_snippet_reachable(txt)
+            for txt in (h.read_text(encoding="utf-8", errors="replace") for h in effective_guard_hooks(proj))
+        )
+        broken_links = [
+            p.name for p in (proj / ".agents" / "skills").glob("*") if p.is_symlink() and not p.exists()
+        ] if (proj / ".agents" / "skills").is_dir() else ["skills 目录缺失"]
+        # 技能软链接不入库：新克隆或新开的并行工作树里要跑一次 `ws link` 才有
+        missing_skills = [
+            d.name for d in sorted(SKILLS_SRC.iterdir())
+            if (d / "SKILL.md").is_file() and not (proj / ".agents" / "skills" / d.name / "SKILL.md").is_file()
+        ]
+
+        for lbl, flag in [
+            ("AGENTS.md 存在且含有效 Mode 状态", agents_ok),
+            ("CLAUDE.md 存在且已桥接 @AGENTS.md", claude_md_ok),
+            (".claude/skills 桥接软链接", claude_link_ok),
+            ("Antigravity PreToolUse 钩子（Mode Gate + Read Guard）", agy_hook_ok),
+            ("Claude Code 钩子（Mode Gate + Read Guard + PostToolUse）", claude_hook_ok),
+            ("Git pre-commit 门禁钩子已生效（Git 实际会调用）", git_hook_ok),
+            ("技能软链接无断链", len(broken_links) == 0),
+            ("母仓技能均已挂载", len(missing_skills) == 0),
+        ]:
+            ok = ok and flag
+            print(f"  [{'OK' if flag else 'ERR'}] {lbl}")
+        local_state = read_local_mode_state(proj)
+        if local_state is not None:
+            s_note = f"（Active-Slice: {local_state['slice']}）" if local_state.get("slice") else ""
+            print(f"  [INFO] 当前工作树启用了本地 Mode 覆盖: {local_state['mode']}{s_note}")
+        if missing_skills:
+            print(f"  [提示] 缺少技能 {', '.join(missing_skills)}：技能软链接是本机产物不入库，在这个目录运行一次 `ws link` 即可。")
+        if not agy_hook_ok:
+            print("  [提示] Antigravity 钩子缺失或为旧版（缺 Read Guard）：运行 `ws link` 重写。")
+        if not claude_hook_ok:
+            print("  [提示] Claude Code 钩子缺失或为旧版（缺 Read Guard 或 PostToolUse 事后核对）：运行 `ws link` 重写。")
+        if not git_hook_ok and git_hook_unreachable:
+            print("  [提示] 门禁片段排在钩子里的 `exec` / `exit` 之后，永远执行不到：运行 `ws link` 会把它挪到钩子开头。")
+        elif not git_hook_ok and git_hook_written:
+            print("  [提示] 门禁片段已写入钩子文件，但 `core.hooksPath` 没有指向它，提交时不会执行：Husky 工程请运行 `npm install`（或 `npx husky`）；其他工程运行 `ws link`。")
+        elif not git_hook_ok:
+            print("  [提示] 未找到已注入门禁的 pre-commit 钩子：运行 `ws link` 重写。")
+        if not claude_link_ok and claude_skills_path.is_dir():
+            print("  [提示] 检测到实体目录 `.claude/skills/`：请将其内自定义技能移入 `.agents/skills/` 后删除空目录再跑 `ws link`。")
+
+    return 0 if ok else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="ws", description="通用 AI 工程工作流母仓（Agent Harness）CLI", allow_abbrev=False)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_init = sub.add_parser("init", help="初始化新项目仓或无损接入存量仓", allow_abbrev=False)
+    p_init.add_argument("project_dir", nargs="?", default="", help="目标项目路径（省略则默认当前目录）")
+    p_init.add_argument("--name", default="", help="项目显示名称")
+    p_init.add_argument("--mode", choices=["design", "build"], default="design", help="初始阶段模式（默认 design）")
+    p_init.set_defaults(func=cmd_init)
+
+    p_mode = sub.add_parser(
+        "mode",
+        usage="ws mode {design,build} [project_dir] [--slice SLICE] [--local] | ws mode --clear-local [project_dir]",
+        help="切换 design / build 阶段门禁（支持 --local 工作树本地覆盖）",
+        allow_abbrev=False,
+    )
+    p_mode.add_argument("mode_args", nargs="*", metavar="ARGS", help="目标模式（design|build）及可选项目路径")
+    p_mode.add_argument("--slice", default=None, help="同步更新 Active-Slice 路径（如 design/slices/01-order.md）")
+    p_mode.add_argument("--local", action="store_true", help="仅写入当前 Git 工作树本地状态（不改 AGENTS.md，防并行合流冲突）")
+    p_mode.add_argument("--clear-local", action="store_true", help="清除当前 Git 工作树的本地 Mode 覆盖，恢复继承 AGENTS.md")
+    p_mode.set_defaults(func=cmd_mode)
+
+    p_line = sub.add_parser("line", help="管理基于 git worktree 的多需求并行开发线（new/list/check/sync/rm）", allow_abbrev=False)
+    line_sub = p_line.add_subparsers(dest="line_cmd", required=True)
+
+    p_line_list = line_sub.add_parser("list", help="列出当前项目所有活跃的并行开发线与状态", allow_abbrev=False)
+    p_line_list.add_argument("project_dir", nargs="?", default="", help="项目路径（省略则默认当前目录）")
+    p_line_list.set_defaults(func=cmd_line_list)
+
+    p_line_new = line_sub.add_parser("new", help="基于主分支开启独立工作树开发线（自动挂本地 build 模式、软链与钩子）", allow_abbrev=False)
+    p_line_new.add_argument("name", help="开发线短名称（如 01a-overlays，创建分支 line/<name>）")
+    p_line_new.add_argument("project_dir", nargs="?", default="", help="项目路径（省略则默认当前目录）")
+    p_line_new.add_argument("--slice", default=None, help="绑定当前开发线的 Active-Slice 路径")
+    p_line_new.add_argument("--scope", nargs="+", default=None, help="声明本线独占修改目录（防撞检查）")
+    p_line_new.add_argument("--allow-overlap", action="store_true", help="允许与在跑开发线的声明范围重叠")
+    p_line_new.add_argument("--mode", choices=["build", "design"], default="build", help="工作树初始本地模式（默认 build）")
+    p_line_new.set_defaults(func=cmd_line_new)
+
+    p_line_chk = line_sub.add_parser("check", help="检查所有并行开发线是否存在修改文件碰撞或与主分支合并冲突", allow_abbrev=False)
+    p_line_chk.add_argument("project_dir", nargs="?", default="", help="项目路径（省略则默认当前目录）")
+    p_line_chk.set_defaults(func=cmd_line_check)
+
+    p_line_sync = line_sub.add_parser("sync", help="变基跟上主分支、执行门禁检查并快进合入主分支", allow_abbrev=False)
+    p_line_sync.add_argument("target", nargs="?", default="", help="开发线名称或路径（在开发线目录内运行时可省略）")
+    p_line_sync.add_argument("project_dir", nargs="?", default="", help="可选主项目路径（从项目外按线名合入时使用）")
+    p_line_sync.add_argument("--skip-check", action="store_true", help="跳过合入前的门禁脚本检查（仍强制扫描密钥）")
+    p_line_sync.set_defaults(func=cmd_line_sync)
+
+    p_line_rm = line_sub.add_parser("rm", help="安全收掉已合流的开发线（清理工作树与本地分支）", allow_abbrev=False)
+    p_line_rm.add_argument("name", help="要清理的开发线名称")
+    p_line_rm.add_argument("project_dir", nargs="?", default="", help="项目路径（省略则默认当前目录）")
+    p_line_rm.add_argument("--discard", action="store_true", help="确认丢弃未合并提交或仅存于该工作树的本地文件")
+    p_line_rm.set_defaults(func=cmd_line_rm)
+
+    p_map = sub.add_parser("map", help="生成目录或文件的 AST 符号与章节行号骨架地图", allow_abbrev=False)
+    p_map.add_argument("target", nargs="?", default=".", help="目标目录或文件路径（默认当前目录）")
+    p_map.add_argument("--max-lines", type=int, default=180, help="最大输出行数（默认 180）")
+    p_map.add_argument("--depth", type=int, default=4, help="目录递归最大深度（默认 4）")
+    p_map.set_defaults(func=cmd_map)
+
+    p_chk = sub.add_parser("check", help="运行阶段门禁核对 + 密钥扫描 + 反假实现 + 模块契约边界检查", allow_abbrev=False)
+    p_chk.add_argument("project_dir", nargs="?", default="", help="项目路径（默认当前目录）")
+    p_chk.add_argument("--diff", action="store_true", help="对占位符与空异常启用增量检查（适合存量仓）")
+    p_chk.add_argument("--base", default="", help="指定增量与历史提交密钥扫描的基线分支/引用（如 main）")
+    p_chk.add_argument("--record-full", action="store_true", help="全量通过后在 Git 公共目录签发跨工作树共享代码树硬凭证")
+    p_chk.add_argument("--verify-full", nargs="?", const="HEAD", default=None, metavar="REV", help="核验指定提交（默认 HEAD）是否已签发本机全量代码树凭证")
+    p_chk.set_defaults(func=cmd_check)
+
+    p_link = sub.add_parser("link", help="修复或重连三端技能软链接、胶囊与钩子", allow_abbrev=False)
+    p_link.add_argument("project_dir", nargs="?", default="", help="指定项目路径（省略则修复全部已注册项目）")
+    p_link.set_defaults(func=cmd_link)
+
+    p_sync = sub.add_parser("sync", help="同步最新技能、宪章区块与原型胶囊", allow_abbrev=False)
+    p_sync.add_argument("project_dir", nargs="?", default="", help="指定项目路径（省略则同步全部已注册项目）")
+    p_sync.set_defaults(func=cmd_sync)
+
+    p_prom = sub.add_parser("promote", help="将 sandbox/<idea> 毕业迁出为正式业务仓库", allow_abbrev=False)
+    p_prom.add_argument("idea", help="sandbox 下的目录名")
+    p_prom.add_argument("target_dir", help="目标新仓库路径")
+    p_prom.add_argument("--name", default="", help="新项目显示名称")
+    p_prom.set_defaults(func=cmd_promote)
+
+    p_doc = sub.add_parser("doctor", help="检查母仓与项目三端挂载健康度", allow_abbrev=False)
+    p_doc.add_argument("project_dir", nargs="?", default="", help="可选业务项目路径")
+    p_doc.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        res = args.func(args)
+    except WsError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+    return int(res) if isinstance(res, int) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
