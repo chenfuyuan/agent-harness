@@ -3,17 +3,17 @@
  *
  * 用法：在原型页面定义 window.PROTO_SPEC = { ... } 后，于 </body> 前引入本脚本（如 `<script src="./dev-overlay.js"></script>`）：
  *   window.PROTO_SPEC = {
- *     title: '合约交易终端',
- *     views: [{ id: 'trade', label: '交易主屏' }, { id: 'review', label: '复盘账本' }], // 单视图应用可省略
+ *     title: '分镜创作室原型',
+ *     views: [{ id: 'studio', label: '创作舞台' }, { id: 'batch', label: '剧集总览' }], // 单视图应用可省略
  *     states: [
- *       { id: 'normal', label: '正常持仓' },
- *       { id: 'empty', label: '空仓初始态' },
- *       { id: 'danger', label: '止损未挂告警' }
+ *       { id: 'normal', label: '正常态' },
+ *       { id: 'empty', label: '空状态' },
+ *       { id: 'alert', label: '异常拦截态' }
  *     ],
  *     specs: [
- *       { kind: 'contract', text: '<OrderTicket> 未填止损价时，开仓主按钮置灰不可点并实时显示预计亏损金额' },
- *       { kind: 'mock', text: 'K线与盘口深度为静态模拟数据，Build 阶段接入欧易公开 WebSocket' },
- *       { kind: 'dev', text: '具体的强平维持保证金率档位由开发阶段按交易所接口实测为准' }
+ *       { kind: 'contract', text: '<PrimaryAction> 前置校验未通过时，主操作按钮禁用并展示明确修复提示' },
+ *       { kind: 'mock', text: '当前预览素材为本地静态样本，Build 阶段直连真实本地目录与接口' },
+ *       { kind: 'dev', text: '分页与虚拟滚动阈值由开发阶段按实测帧率确定' }
  *     ],
  *     onChange: ({ view, state }) => { ... } // 可选回调；同时自动在 document.documentElement 设置 data-proto-view / data-proto-state
  *   };

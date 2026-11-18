@@ -68,14 +68,18 @@ python3 tests/test_harness.py
 ./bin/ws check ~/code/my-app --record-full
 ./bin/ws check ~/code/my-app --verify-full HEAD
 
-# 5. 母仓升级技能或宪章后，一键同步/修复所有已挂载项目
+# 5. 查看与校验模块契约及母仓错法模式卡（playbooks/）经验水位
+./bin/ws learn status ~/code/my-app
+./bin/ws learn check ~/code/my-app
+
+# 6. 母仓升级技能或宪章后，一键同步/修复所有已挂载项目
 ./bin/ws sync
 ./bin/ws link
 
-# 6. 将 sandbox/<idea> 里的早期探索毕业迁出为独立下游仓库
+# 7. 将 sandbox/<idea> 里的早期探索毕业迁出为独立下游仓库
 ./bin/ws promote my-idea ~/code/my-new-app
 
-# 7. 环境与三端挂载体检 / 母仓回归测试
+# 8. 环境与三端挂载体检 / 母仓回归测试
 ./bin/ws doctor
 python3 tests/test_harness.py
 ```
@@ -92,15 +96,17 @@ python3 tests/test_harness.py
 
 ---
 
-## 四、当前内置核心技能（产品设计开发包）
+## 四、当前内置核心技能（全闭环研发与自进化包）
 
 | 技能名 | 阶段 | 职责摘要 |
 | :--- | :--- | :--- |
 | [`explore-architect`](./harness/skills/explore-architect/SKILL.md) | `design` | L1–L3 复杂度自适应分流、四源交叉深挖、面包板单向门决策、生成 `design/SYSTEM.md` |
 | [`bespoke-prototype`](./harness/skills/bespoke-prototype/SKILL.md) | `design` | 反后台化空间拓扑、三旋钮审美定调、主屏双变体比稿、生成 `DESIGN.md` + `tokens.css` + 零构建交互原型 |
 | [`tech-architect`](./harness/skills/tech-architect/SKILL.md) | `design` | 业内标杆开源代码架构与工程模式深挖（奖章数据流、状态机、同构引擎）、轻量化裁剪、生成可执行 `design/TECH.md` |
-| [`slice-build`](./harness/skills/slice-build/SKILL.md) | `build` | 切片级技术方案设计、子代理隔离真数据探针、模块就近 `AGENTS.md`、算账 TDD 与务实 UI 还原 |
-| [`adversarial-review`](./harness/skills/adversarial-review/SKILL.md) | 跨关卡 | 开工前工程师挑刺（Builder Check）+ 交付前零上下文/跨模型 Diff 审计 |
+| [`slice-build`](./harness/skills/slice-build/SKILL.md) | `build` | 切片级技术方案设计（联动 `playbooks/` 防坑）、子代理隔离真数据探针、模块就近 `AGENTS.md`、算账 TDD 与务实 UI 还原 |
+| [`systematic-debugging`](./harness/skills/systematic-debugging/SKILL.md) | 排障治本 | 零改动 RED 取证、AI/竞态录带定格回放、违约归属与级联溯源、动手前「治本四校」防症状消音补丁 |
+| [`adversarial-review`](./harness/skills/adversarial-review/SKILL.md) | 跨关卡 | 开工前工程师挑刺（Builder Check）+ 交付前零上下文 Diff 审计 + 故障修复治本审查（Cure Audit） |
+| [`compound-learn`](./harness/skills/compound-learn/SKILL.md) | 自进化 | 三级经验飞轮（模块 `AGENTS.md` → 母仓 `playbooks/` 错法卡 → 事不过二编译进代码守卫，毕业即删旧字） |
 
 ---
 

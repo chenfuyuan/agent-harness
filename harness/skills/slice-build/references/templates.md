@@ -24,15 +24,17 @@
 ```markdown
 # Slice NN: <切片名称>
 
-- **状态**：`planned` | `building` | `in-real-use` | `validated`
+- **状态**：`proposed` | `approved` | `building` | `pending-acceptance` | `verified` | `used`
+- **选定方案**：<记录用户从多方案比选中拍板的方案及核心架构取舍摘要；未获用户选择前保持 `proposed` 禁开线>
 - **关联设计**：`design/SYSTEM.md#<章节>` · `design/TECH.md#<章节>` · 原型视图 `<view/state>`
 
-## 1. 本片目标与边界
+## 1. 本片目标、领域暗坑与边界
 - **解决什么问题 & 怎样算真用有效**：...
+- **领域暗坑与业内最佳实践对标**：<资深领域架构师视角点破的 2–3 个领域死穴 + 对标的顶级开源/工业架构模式>
 - **本片明确不做**：...
 
-## 2. 技术实现方案与开工前核验（Tech Design & Pre-Build Spike）
-- **核心数据结构 / 状态机 / 算法方案**（对齐业内最佳实践与 `TECH.md`，禁照原型硬写面条代码）：...
+## 2. 代码与数据架构设计及真数据核验（Code Architecture & Pre-Build Spike）
+- **分层职责与核心抽象 / 状态机 / 算式方案**（严格映射 `domain/` 纯计算核 ↔ `app/` 编排 ↔ `infra/` 只加不删迁移，禁照原型硬写面条代码）：...
 - **需验证的外部接口/数据假设 & Spike 实测结论（子代理回填）**：<真实字段样例与坑点>
 
 ## 3. 原子任务与可执行验收

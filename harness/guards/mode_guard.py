@@ -555,7 +555,7 @@ def inspect_ws_or_line_command(words: list[str], vcwd: str) -> tuple[str, str, b
         ):
             return (
                 "ask",
-                "检测到通过 `scripts/line new` 开启并行开发线解锁编码阶段。仅在您已拍板原型与当前切片范围后批准。",
+                "检测到通过 `scripts/line new` 开启并行开发线解锁编码阶段。仅在 AI 已给出融合业内最佳实践与代码架构的多套方案、且您已明确选定方案后批准。",
                 True,
             )
         return "allow", "", True
@@ -612,7 +612,7 @@ def inspect_ws_or_line_command(words: list[str], vcwd: str) -> tuple[str, str, b
             if target_in_design:
                 return (
                     "ask",
-                    "检测到通过终端命令切换 `Mode: build` 解锁编码阶段。仅在您已拍板原型与当前切片范围后批准。",
+                    "检测到通过终端命令切换 `Mode: build` 解锁编码阶段。仅在 AI 已给出融合业内最佳实践与代码架构的多套方案、且您已明确选定方案后批准。",
                     True,
                 )
             return "allow", "", True
@@ -669,7 +669,7 @@ def inspect_ws_or_line_command(words: list[str], vcwd: str) -> tuple[str, str, b
             if eff_mode == "build" and gated:
                 return (
                     "ask",
-                    "检测到通过 `ws line new` 开启 `Mode: build` 并行开发线解锁编码阶段。仅在您已拍板原型与当前切片范围后批准。",
+                    "检测到通过 `ws line new` 开启 `Mode: build` 并行开发线解锁编码阶段。仅在 AI 已给出融合业内最佳实践与代码架构的多套方案、且您已明确选定方案后批准。",
                     True,
                 )
             return "allow", "", eff_mode == "build"
@@ -677,7 +677,7 @@ def inspect_ws_or_line_command(words: list[str], vcwd: str) -> tuple[str, str, b
         if line_sub == "sync" and any(a == "--skip-check" or a.startswith("--skip") for a in l_args):
             return (
                 "ask",
-                "检测到 `ws line sync --skip-check` 将跳过合流前门禁检查，请确认是否批准。",
+                "检测到 `ws line sync` 传入 `--skip-*` 将跳过合流前门禁或验收沉淀检查，请确认是否批准。",
                 False,
             )
 

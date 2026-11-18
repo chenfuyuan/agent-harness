@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -103,7 +104,15 @@ class HarnessTestSuite(unittest.TestCase):
         # 母仓技能软链接是本机产物：写进忽略清单，不随仓库入库
         self.assertIn(".agents/skills/explore-architect", gi_text.splitlines())
 
-        for skill in ("explore-architect", "bespoke-prototype", "tech-architect", "slice-build", "adversarial-review"):
+        for skill in (
+            "explore-architect",
+            "bespoke-prototype",
+            "tech-architect",
+            "slice-build",
+            "systematic-debugging",
+            "adversarial-review",
+            "compound-learn",
+        ):
             s_link = proj / ".agents" / "skills" / skill
             self.assertTrue(s_link.is_symlink(), f"{skill} 应为软链接")
             self.assertTrue((s_link / "SKILL.md").is_file(), f"{skill}/SKILL.md 应可读")
@@ -867,7 +876,15 @@ class HarnessTestSuite(unittest.TestCase):
         link_res = self.run_cmd(["python3", str(WS_BIN), "link"], cwd=HUB)
         self.assertEqual(link_res.returncode, 0, link_res.stderr)
         self.assertIn("并行工作树 1 条", link_res.stdout)
-        for skill in ("explore-architect", "bespoke-prototype", "tech-architect", "slice-build", "adversarial-review"):
+        for skill in (
+            "explore-architect",
+            "bespoke-prototype",
+            "tech-architect",
+            "slice-build",
+            "systematic-debugging",
+            "adversarial-review",
+            "compound-learn",
+        ):
             self.assertTrue((line / ".agents" / "skills" / skill / "SKILL.md").is_file(), f"{skill} 在工作树里应可读")
         self.assertTrue((line / ".claude" / "settings.local.json").is_file())
         self.assertEqual(self.run_cmd(["git", "status", "--porcelain"], cwd=line).stdout, "")
@@ -1176,7 +1193,31 @@ class HarnessTestSuite(unittest.TestCase):
         self.run_cmd(["git", "add", "AGENTS.md"], cwd=proj)
         self.assertEqual(self.run_cmd(["git", "commit", "-m", "chore: lock main in design mode"], cwd=proj).returncode, 0)
 
-        # 4) 开启两条正交开发线（01a-overlays 与 01b-exec），校验范围防撞、软链继承与本地 build 隔离
+        # 4) 开工前多方案比选门禁：缺失切片单、proposed/draft 未拍板状态、或省略 --slice 绕过均必须硬拦截
+        missing_slice = self.run_cmd([
+            "python3", str(WS_BIN), "line", "new", "01a-overlays", str(proj),
+            "--slice", "design/slices/01a-overlays.md", "--scope", "src/overlays",
+        ])
+        self.assertNotEqual(missing_slice.returncode, 0)
+        self.assertIn("尚不存在", missing_slice.stderr)
+
+        slice_a = proj / "design" / "slices" / "01a-overlays.md"
+        slice_a.write_text("# Slice 01a\n\n- **状态**：`proposed`\n", encoding="utf-8")
+        unapproved_slice = self.run_cmd([
+            "python3", str(WS_BIN), "line", "new", "01a-overlays", str(proj),
+            "--slice", "design/slices/01a-overlays.md", "--scope", "src/overlays",
+        ])
+        self.assertNotEqual(unapproved_slice.returncode, 0)
+        self.assertIn("尚未经用户从多方案比选中拍板选定", unapproved_slice.stderr)
+
+        sneak_no_slice = self.run_cmd([
+            "python3", str(WS_BIN), "line", "new", "01a-overlays", str(proj), "--scope", "src/overlays",
+        ])
+        self.assertNotEqual(sneak_no_slice.returncode, 0)
+        self.assertIn("禁止省略 `--slice` 绕过", sneak_no_slice.stderr)
+
+        # 用户选定方案后更新为 approved（主仓未入库新切片单自动迁入工作树，保持主仓 100% 干净免合流冲突）
+        slice_a.write_text("# Slice 01a\n\n- **状态**：`approved`\n- **选定方案**：方案 A\n", encoding="utf-8")
         l1 = self.run_cmd([
             "python3", str(WS_BIN), "line", "new", "01a-overlays", str(proj),
             "--slice", "design/slices/01a-overlays.md", "--scope", "src/overlays",
@@ -1184,9 +1225,11 @@ class HarnessTestSuite(unittest.TestCase):
         self.assertEqual(l1.returncode, 0, l1.stderr)
         wt_a = self.tmp_path / "crypto-app-lines" / "01a-overlays"
         self.assertTrue(wt_a.is_dir())
+        self.assertTrue((wt_a / "design" / "slices" / "01a-overlays.md").is_file())
+        self.assertFalse(slice_a.exists(), "未入库切片单应迁入开发线工作树以免日后快进合流冲突")
+        self.assertEqual(self.run_cmd(["git", "status", "--porcelain"], cwd=proj).stdout, "")
         self.assertTrue((wt_a / ".env").is_symlink(), ".env 应自动软链至并行工作树")
         self.assertEqual((wt_a / ".env").read_text(encoding="utf-8"), "OKX_PROXY=http://127.0.0.1:7897\n")
-        self.assertEqual(self.run_cmd(["git", "status", "--porcelain"], cwd=wt_a).stdout, "")
         self.assertEqual(
             self.claude_decision(wt_a, "Write", {"file_path": str(wt_a / "src" / "overlays" / "ema.py"), "content": "v = 1\n"}),
             "allow",
@@ -1204,12 +1247,16 @@ class HarnessTestSuite(unittest.TestCase):
         self.assertIn("范围冲突", dup_scope.stderr)
 
         # 正交范围正常开第二条线
+        slice_b = proj / "design" / "slices" / "01b-exec.md"
+        slice_b.write_text("# Slice 01b\n\n- **状态**：`approved`\n- **选定方案**：方案 B\n", encoding="utf-8")
         l2 = self.run_cmd([
             "python3", str(WS_BIN), "line", "new", "01b-exec", str(proj),
             "--slice", "design/slices/01b-exec.md", "--scope", "src/exec",
         ])
         self.assertEqual(l2.returncode, 0, l2.stderr)
         wt_b = self.tmp_path / "crypto-app-lines" / "01b-exec"
+        self.assertTrue((wt_b / "design" / "slices" / "01b-exec.md").is_file())
+        self.assertEqual(self.run_cmd(["git", "status", "--porcelain"], cwd=proj).stdout, "")
 
         ls_out = self.run_cmd(["python3", str(WS_BIN), "line", "list", str(proj)])
         self.assertEqual(ls_out.returncode, 0)
@@ -1246,9 +1293,16 @@ class HarnessTestSuite(unittest.TestCase):
         self.assertNotEqual(sync_fail.returncode, 0)
         self.assertFalse((proj / "src" / "overlays" / "ema.py").exists())
 
-        # 修复门禁后合入 main
+        # 修复门禁后，未登记验收沉淀前仍阻断合入 main；完成 ws line distill 后合入通过
         self.run_cmd(["git", "rm", "-q", "FAIL_GATE"], cwd=wt_a)
         self.assertEqual(self.run_cmd(["git", "commit", "-m", "fix: remove fail marker"], cwd=wt_a).returncode, 0)
+        sync_no_distill = self.run_cmd(["python3", str(WS_BIN), "line", "sync"], cwd=wt_a)
+        self.assertNotEqual(sync_no_distill.returncode, 0)
+        self.assertIn("尚未登记真人验收后的收尾沉淀", sync_no_distill.stderr)
+        self.assertFalse((proj / "src" / "overlays" / "ema.py").exists())
+
+        dist_a = self.run_cmd(["python3", str(WS_BIN), "line", "distill", "--note", "验收通过并核对契约"], cwd=wt_a)
+        self.assertEqual(dist_a.returncode, 0, dist_a.stdout + dist_a.stderr)
         sync_a = self.run_cmd(["python3", str(WS_BIN), "line", "sync"], cwd=wt_a)
         self.assertEqual(sync_a.returncode, 0, sync_a.stdout + sync_a.stderr)
         self.assertTrue((proj / "src" / "overlays" / "ema.py").is_file())
@@ -1265,9 +1319,10 @@ class HarnessTestSuite(unittest.TestCase):
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "rm", "01a-overlays", str(proj)]).returncode, 0)
         self.assertFalse(wt_a.exists())
 
-        # 7) 线 B 此时落后于已推进的 main：ws line sync 自动 rebase 跟上 main 过检并快进合入
+        # 7) 线 B 此时落后于已推进的 main：先 distill 锁当前 HEAD，ws line sync 自动 rebase 跟上 main 过检并同步推进 distilled_head
         self.run_cmd(["git", "add", "-A"], cwd=wt_b)
         self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: order execution"], cwd=wt_b).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill", "01b-exec", str(proj)]).returncode, 0)
         sync_b = self.run_cmd(["python3", str(WS_BIN), "line", "sync", "01b-exec", str(proj)])
         self.assertEqual(sync_b.returncode, 0, sync_b.stdout + sync_b.stderr)
         self.assertTrue((proj / "src" / "exec" / "order.py").is_file())
@@ -1308,6 +1363,7 @@ class HarnessTestSuite(unittest.TestCase):
             f'"{WS_BIN}" line new sneak --slice design/slices/01--mode=design.md',
             "./scripts/line new sneak",
             f'"{WS_BIN}" line sync sneak --skip-check',
+            f'"{WS_BIN}" line sync sneak --skip-distill',
         ):
             self.assertEqual(
                 self.claude_decision(proj, "Bash", {"command": bypass_cmd}),
@@ -1369,6 +1425,7 @@ class HarnessTestSuite(unittest.TestCase):
         (wt_api / "api" / "clean.py").write_text("READY = True\n", encoding="utf-8")
         self.run_cmd(["git", "add", "-A"], cwd=wt_api)
         self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: clean api"], cwd=wt_api).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill", "api"], cwd=proj).returncode, 0)
         sync_ok = self.run_cmd(["python3", str(WS_BIN), "line", "sync", "api"], cwd=proj)
         self.assertEqual(sync_ok.returncode, 0, sync_ok.stdout + sync_ok.stderr)
 
@@ -1447,6 +1504,7 @@ class HarnessTestSuite(unittest.TestCase):
         self.assertEqual(rec_ok.returncode, 0, rec_ok.stdout + rec_ok.stderr)
         self.run_cmd(["git", "add", "-A"], cwd=wt)
         self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: value 2"], cwd=wt).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill", "feat-ci"], cwd=proj).returncode, 0)
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "sync", "feat-ci"], cwd=proj).returncode, 0)
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "rm", "feat-ci", str(proj)]).returncode, 0)
 
@@ -1471,6 +1529,145 @@ class HarnessTestSuite(unittest.TestCase):
         self.assertNotEqual(ver_blocked.returncode, 0)
         ver_tag = self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--verify-full", "refs/tags/v1.0.0^{commit}"])
         self.assertEqual(ver_tag.returncode, 0, ver_tag.stdout + ver_tag.stderr)
+
+    def test_19_debugging_compound_learn_and_playbook_budget(self):
+        # 1) 母仓真实内置 playbooks 必须通过 ws learn check
+        real_chk = self.run_cmd(["python3", str(WS_BIN), "learn", "check"], cwd=HUB)
+        self.assertEqual(real_chk.returncode, 0, real_chk.stdout + real_chk.stderr)
+        self.assertIn("经验飞轮容量与公私分离检查通过", real_chk.stdout)
+
+        # 2) 项目模块契约水位报告（OK / WARN / OVER）与超限拦截
+        proj = self.tmp_path / "learn-app"
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "init", str(proj), "--mode", "build"]).returncode, 0)
+        (proj / "src" / "orders").mkdir(parents=True)
+        (proj / "src" / "orders" / "AGENTS.md").write_text(
+            "\n".join(f"- rule {i}" for i in range(40)) + "\n",
+            encoding="utf-8",
+        )
+        st = self.run_cmd(["python3", str(WS_BIN), "learn", "status", str(proj)])
+        self.assertEqual(st.returncode, 0, st.stderr)
+        self.assertIn("[WARN] src/orders/AGENTS.md: 40/45 非空行", st.stdout)
+
+        # 3) WS_PLAYBOOKS_DIR 隔离验证：未登记卡、超行数卡、私有路径泄露与 >10 张卡均被 ws learn check 硬拦
+        pb_tmp = self.tmp_path / "playbooks"
+        pb_tmp.mkdir()
+        (pb_tmp / "INDEX.md").write_text("# Index\n- F01.md\n", encoding="utf-8")
+        (pb_tmp / "F01.md").write_text("# F01\nok\n", encoding="utf-8")
+        env_pb = {**self.env, "WS_PLAYBOOKS_DIR": str(pb_tmp)}
+
+        ok_res = subprocess.run(
+            ["python3", str(WS_BIN), "learn", "check", str(proj)],
+            text=True,
+            capture_output=True,
+            env=env_pb,
+        )
+        self.assertEqual(ok_res.returncode, 0, ok_res.stdout + ok_res.stderr)
+
+        # 未登记在 INDEX.md 的孤儿卡 + 本机私有路径泄露拦截
+        (pb_tmp / "F02-leak.md").write_text("# Leak\nSee /Users/alice/secret/app.py\n", encoding="utf-8")
+        leak_res = subprocess.run(
+            ["python3", str(WS_BIN), "learn", "check", str(proj)],
+            text=True,
+            capture_output=True,
+            env=env_pb,
+        )
+        self.assertNotEqual(leak_res.returncode, 0)
+        self.assertIn("未登记在 INDEX.md", leak_res.stderr)
+        self.assertIn("私有用户目录路径", leak_res.stderr)
+
+    def test_20_ws_line_acceptance_distill_env_and_preview_gate(self):
+        proj = self.tmp_path / "preview-app"
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "init", str(proj), "--mode", "build"]).returncode, 0)
+        (proj / "deploy").mkdir(parents=True)
+        gi = proj / ".gitignore"
+        gi.write_text(gi.read_text(encoding="utf-8") + "repro/\n", encoding="utf-8")
+
+        # 占用空闲基准端口 base+1，验证 ws line new 自动跳过忙端口分配 slot=2
+        busy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        busy_sock.bind(("127.0.0.1", 0))
+        busy_sock.listen(1)
+        try:
+            busy_port = busy_sock.getsockname()[1]
+            base_port = busy_port - 1
+            (proj / "deploy" / "compose.yaml").write_text(
+                f'services:\n  web:\n    ports:\n      - "127.0.0.1:${{WEB_PORT:-{base_port}}}:5175"\n',
+                encoding="utf-8",
+            )
+            self.run_cmd(["git", "add", "-A"], cwd=proj)
+            self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: init"], cwd=proj).returncode, 0)
+            self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "mode", "design", str(proj)]).returncode, 0)
+            self.run_cmd(["git", "add", "AGENTS.md"], cwd=proj)
+            self.assertEqual(self.run_cmd(["git", "commit", "-m", "chore: lock design"], cwd=proj).returncode, 0)
+
+            l_res = self.run_cmd(["python3", str(WS_BIN), "line", "new", "feat-ui", str(proj)])
+            self.assertEqual(l_res.returncode, 0, l_res.stderr)
+            self.assertIn("槽位 #2", l_res.stdout)
+        finally:
+            busy_sock.close()
+
+        wt = self.tmp_path / "preview-app-lines" / "feat-ui"
+        main_env = self.run_cmd(["python3", str(WS_BIN), "line", "env", str(proj)])
+        self.assertEqual(main_env.returncode, 0, main_env.stderr)
+        self.assertIn("WS_LINE_NAME=''", main_env.stdout)
+        self.assertIn("WS_COMPOSE_PROJECT=preview-app", main_env.stdout)
+
+        wt_env = self.run_cmd(["python3", str(WS_BIN), "line", "env", str(wt)])
+        self.assertEqual(wt_env.returncode, 0, wt_env.stderr)
+        self.assertIn("WS_LINE_NAME=feat-ui", wt_env.stdout)
+        self.assertIn("WS_LINE_SLOT=2", wt_env.stdout)
+        self.assertIn("WS_COMPOSE_PROJECT=preview-app-feat-ui", wt_env.stdout)
+
+        # 未经 ws line 登记的野 git worktree 调用 ws line env 必须拒绝导出防误占主环境
+        rogue_wt = self.tmp_path / "rogue-wt"
+        self.assertEqual(self.run_cmd(["git", "worktree", "add", "--detach", str(rogue_wt), "HEAD"], cwd=proj).returncode, 0)
+        rogue_env = self.run_cmd(["python3", str(WS_BIN), "line", "env", str(rogue_wt)])
+        self.assertNotEqual(rogue_env.returncode, 0)
+        self.run_cmd(["git", "worktree", "remove", "--force", str(rogue_wt)], cwd=proj)
+
+        # distill 门禁：未提交改动、残留本地复现文件、模块 AGENTS.md 超限均硬拦截
+        (wt / "src" / "ui").mkdir(parents=True)
+        (wt / "src" / "ui" / "view.py").write_text("VIEW = 1\n", encoding="utf-8")
+        self.assertNotEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt).returncode, 0)
+
+        (wt / "src" / "ui" / "AGENTS.md").write_text("\n".join(f"- r{i}" for i in range(47)) + "\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=wt)
+        self.assertEqual(self.run_cmd(["git", "commit", "--no-verify", "-m", "wip over limit"], cwd=wt).returncode, 0)
+        over_dist = self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt)
+        self.assertNotEqual(over_dist.returncode, 0)
+        self.assertIn("超硬上限", over_dist.stderr)
+
+        (wt / "src" / "ui" / "AGENTS.md").write_text("# UI\n- invariant 1\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=wt)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "docs: slim agents"], cwd=wt).returncode, 0)
+
+        (wt / "repro").mkdir()
+        (wt / "repro" / "tmp.py").write_text("x = 1\n", encoding="utf-8")
+        repro_dist = self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt)
+        self.assertNotEqual(repro_dist.returncode, 0)
+        self.assertIn("repro/", repro_dist.stderr)
+        (wt / "repro" / "tmp.py").unlink()
+        (wt / "repro").rmdir()
+
+        # 正常 distill 通过；若随后又追加新提交，distilled_head 自动失效并再次拦截 sync
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt).returncode, 0)
+        ls_distilled = self.run_cmd(["python3", str(WS_BIN), "line", "list", str(proj)]).stdout
+        self.assertIn("已沉淀", ls_distilled)
+
+        (wt / "src" / "ui" / "view.py").write_text("VIEW = 2\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=wt)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: tweak after distill"], cwd=wt).returncode, 0)
+        ls_stale = self.run_cmd(["python3", str(WS_BIN), "line", "list", str(proj)]).stdout
+        self.assertIn("待验收/未沉淀", ls_stale)
+        self.assertNotEqual(self.run_cmd(["python3", str(WS_BIN), "line", "sync"], cwd=wt).returncode, 0)
+
+        # 若人工批准 --skip-distill 先合入了 main，未补跑 distill 前即便带 --discard 也拒绝删线防漏沉淀
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "sync", "--skip-distill"], cwd=wt).returncode, 0)
+        rm_merged_undist = self.run_cmd(["python3", str(WS_BIN), "line", "rm", "feat-ui", str(proj), "--discard"])
+        self.assertNotEqual(rm_merged_undist.returncode, 0)
+        self.assertIn("尚未完成收线沉淀登记", rm_merged_undist.stderr)
+
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill", "feat-ui", str(proj)]).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "rm", "feat-ui", str(proj)]).returncode, 0)
 
 
 if __name__ == "__main__":

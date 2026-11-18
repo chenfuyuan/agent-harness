@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>（切片 / 模块名）验收报告</title>
+<style>
+/* 真人图文验收报告标准模板（slice-build 预览验收门禁）：
+   复制到主仓本机验收目录 docs/acceptance/<日期>-<线名>/report.html（已被 .gitignore 忽略且不受 Mode: design 拦截）填入实测内容并 open 打开浏览器。
+   阅读动线：先看要用户拍板的事与可点击预览地址，再看逐场景截图与独立重算核对，最后看代码评审大白话摘要、拟沉淀草稿与上线后观察。 */
+:root {
+  --bg: #f4f6f5; --surface: #ffffff; --fg: #1b2320; --muted: #5a6662; --line: #dce2df;
+  --accent: #2c5d63; --accent-soft: #e3eeef;
+  --ok: #2b7a4b; --ok-bg: #e3f2e8; --part: #9a6517; --part-bg: #f7ecd9; --wait: #5f6670; --wait-bg: #eceef1;
+  --code-bg: #eef1f0;
+  --display: "Songti SC", "STSong", "Noto Serif SC", serif;
+  --body: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root {
+  --bg: #111614; --surface: #19201d; --fg: #e4ebe7; --muted: #9aa7a2; --line: #2b3431;
+  --accent: #86b9be; --accent-soft: #1d2f31;
+  --ok: #74c493; --ok-bg: #18301f; --part: #e3ad55; --part-bg: #33270f; --wait: #a3abb5; --wait-bg: #242a2f;
+  --code-bg: #1f2725; color-scheme: dark;
+} }
+html { scroll-behavior: smooth; scroll-padding-top: 16px; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 15px; line-height: 1.75; }
+.page { max-width: 900px; margin: 0 auto; padding: 32px 16px 64px; display: flex; flex-direction: column; gap: 36px; }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; line-height: 1.35; margin: 0; }
+h1 { font-size: 30px; font-weight: 700; }
+h2 { font-size: 22px; font-weight: 700; padding-bottom: 6px; border-bottom: 2px solid var(--accent); }
+h3 { font-size: 18px; font-weight: 600; }
+p { margin: 0; }
+a { color: var(--accent); }
+a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code { font-family: var(--mono); font-size: 0.88em; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+section { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.eyebrow { font-size: 13px; letter-spacing: 0.06em; color: var(--muted); }
+.lede { color: var(--muted); max-width: 68ch; }
+.toc { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 14px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { font-size: 13px; padding: 2px 10px; border-radius: 999px; white-space: nowrap; }
+.ok { background: var(--ok-bg); color: var(--ok); }
+.part { background: var(--part-bg); color: var(--part); }
+.wait { background: var(--wait-bg); color: var(--wait); }
+.decide { display: flex; flex-direction: column; gap: 12px; }
+.item { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.item .rec { color: var(--accent); font-weight: 600; }
+.item ul, .plain { margin: 0; padding-left: 1.3em; display: flex; flex-direction: column; gap: 4px; }
+.scen { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.scen-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+.expect { border-left: 3px solid var(--line); padding-left: 12px; color: var(--muted); }
+.label { font-size: 13px; letter-spacing: 0.04em; color: var(--muted); font-weight: 600; }
+figure { margin: 0; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.shot { max-height: 620px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+.shot img { display: block; width: 100%; height: auto; }
+figcaption { font-size: 13px; color: var(--muted); }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 14px; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; background: var(--bg); }
+td.wrap { white-space: normal; min-width: 14em; }
+.num { text-align: right; }
+.quote { background: var(--code-bg); border-radius: 8px; padding: 10px 14px; white-space: pre-wrap; font-size: 14px; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header style="display:flex;flex-direction:column;gap:10px">
+  <p class="eyebrow">（项目 · 切片编号）· 真人验收报告 · （日期）· 开发线 （名字）· 尚未合入 main</p>
+  <h1>（切片 / 功能名）验收</h1>
+  <p class="lede">（一段大白话：这次做完让你能做什么；当前已部署在本机哪个预览环境、用的是什么真实数据。）</p>
+  <div class="chips">
+    <span class="chip ok">实测通过 ? 项：（场景简述）</span>
+    <span class="chip wait">状态：待你真机验收确认（确认后再沉淀并合入 main）</span>
+  </div>
+  <nav class="toc">
+    <a href="#hands-on">要你亲手点的</a>
+    <a href="#decide">要你确认的事</a>
+    <a href="#scenarios">每条场景与截图</a>
+    <a href="#review">代码评审摘要</a>
+    <a href="#distill">拟沉淀经验</a>
+    <a href="#known">已知问题与观察</a>
+  </nav>
+</header>
+
+<section id="hands-on">
+  <h2>要你亲手点的（本机预览已就绪）</h2>
+  <div class="item">
+    <p class="rec">预览地址：<a href="http://127.0.0.1:5175" target="_blank" rel="noopener">http://127.0.0.1:5175</a>（接口健康检查：<a href="http://127.0.0.1:8750/api/v1/health" target="_blank" rel="noopener">/api/v1/health</a>）</p>
+    <ul class="plain">
+      <li><strong>第 1 步</strong>：（打开哪里、点哪个按钮、该看到什么变化。）</li>
+      <li><strong>第 2 步</strong>：（试一下什么异常/边界操作、该看到什么拦阻提示。）</li>
+    </ul>
+    <p style="color:var(--muted);font-size:13px">点过满意后，回对话说一声「验收通过」，AI 才会落盘沉淀、合入 <code>main</code> 并收掉本开发线；若有不顺手的地方直接提，在本开发线改好重刷预览。</p>
+  </div>
+</section>
+
+<section id="decide">
+  <h2>要你定或确认的事</h2>
+  <div class="decide">
+    <div class="item">
+      <h3>1. （需要你拍板的取舍，若本次无单向门则写“本次无额外待定项，仅确认交互体感即可”）</h3>
+      <p>（来龙去脉与具体例子。）</p>
+      <p class="rec">推荐做法与后果说明。</p>
+    </div>
+  </div>
+</section>
+
+<section id="scenarios">
+  <h2>每条场景与核对证据</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>场景</th><th>验证内容</th><th>结论</th><th>核对方式</th></tr></thead>
+      <tbody>
+        <tr><td>S1</td><td class="wrap">（一句话描述场景）</td><td><span class="chip ok">通过</span></td><td>预览环境实测 + 代码外手算对账</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="scen" id="s1">
+    <div class="scen-head"><h3>S1 （场景标题）</h3><span class="chip ok">通过</span></div>
+    <p class="expect">期望：（切片目标或业务规则原文。）</p>
+    <p><span class="label">做了什么</span>　（在预览环境输入了什么数据、点了什么操作。）</p>
+    <p><span class="label">看到什么</span>　（界面与接口返回的实际结果。）</p>
+    <div class="grid2">
+      <figure><div class="shot"><img src="shots/01-overview.png" alt="实测页面截图"></div><figcaption>（一句话说明图里核对了什么）</figcaption></figure>
+    </div>
+    <p><span class="label">独立重算核对</span>　（不看业务代码手算的期望数值 vs 实际显示数值。）</p>
+  </div>
+</section>
+
+<section id="review">
+  <h2>独立代码评审摘要</h2>
+  <p>（零上下文子代理审查轮次、全量门禁测试通过数、拦下了几项问题。）</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>级别</th><th>发现了什么风险（大白话）</th><th>怎样治本修掉的</th></tr></thead>
+      <tbody>
+        <tr><td>严重 (Blocker)</td><td class="wrap">（如果不修，你在什么情况下会遇到什么错）</td><td class="wrap">（根因修法与新增回归测试）</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="distill">
+  <h2>收线前拟沉淀的经验（确认验收后落盘）</h2>
+  <ul class="plain">
+    <li><strong>Tier 1 / Tier 2 / Tier 3</strong>：（3–5 行精炼列出准备写进哪份契约、错法卡或自动检查。）</li>
+  </ul>
+</section>
+
+<section id="known">
+  <h2>已知边界与上线后观察</h2>
+  <ul class="plain">
+    <li>（需等真实交易时段或定时周期才看得到的观察项；无则写“无遗留已知问题”。）</li>
+  </ul>
+</section>
+
+</div>
+</body>
+</html>

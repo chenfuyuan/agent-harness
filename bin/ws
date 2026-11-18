@@ -4,7 +4,7 @@
 子命令：
   ws init [project_dir] [--name <显示名称>] [--mode <design|build>]  初始化新仓或无损接入存量仓（默认当前目录）
   ws mode <design|build> [project_dir] [--slice <path>] [--local]    切换阶段门禁（支持 --local 工作树本地覆盖）
-  ws line <new|list|check|sync|rm> ...                               管理基于 git worktree 的多需求并行开发线
+  ws line <new|list|env|check|distill|sync|rm> ...                   管理基于 git worktree 的多需求并行开发线与验收门禁
   ws map [target] [--max-lines <N>] [--depth <N>]                    生成目录或文件的 AST 符号与章节行号骨架地图
   ws check [project_dir] [--diff] [--record-full | --verify-full]    运行质量与安全门禁，签发或核验跨工作树共享全量代码树凭证
   ws link [project_dir]                                              修复或重连软链接、原型胶囊与三端钩子
@@ -20,7 +20,9 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -36,6 +38,7 @@ HUB_ROOT = Path(__file__).resolve().parent.parent
 SKILLS_SRC = HUB_ROOT / "harness" / "skills"
 CHARTER_FILE = HUB_ROOT / "harness" / "rules" / "charter-block.md"
 AGENTS_TPL = HUB_ROOT / "harness" / "rules" / "project-agents.template.md"
+ACCEPTANCE_REPORT_TPL = HUB_ROOT / "harness" / "templates" / "acceptance-report.html"
 OVERLAY_RUNTIME = HUB_ROOT / "harness" / "runtime" / "dev-overlay.js"
 MODE_GUARD = HUB_ROOT / "harness" / "guards" / "mode_guard.py"
 READ_GUARD = HUB_ROOT / "harness" / "guards" / "read_guard.py"
@@ -53,6 +56,19 @@ def get_registry_file() -> Path:
 def get_sandbox_root() -> Path:
     env_sbx = os.environ.get("WS_SANDBOX_DIR")
     return Path(env_sbx).expanduser().resolve() if env_sbx else (HUB_ROOT / "sandbox")
+
+
+def get_playbooks_dir() -> Path:
+    env_pb = os.environ.get("WS_PLAYBOOKS_DIR")
+    return Path(env_pb).expanduser().resolve() if env_pb else (HUB_ROOT / "harness" / "playbooks")
+
+
+PLAYBOOKS_INDEX_MAX_LINES = 35
+PLAYBOOKS_MAX_CARDS = 10
+PLAYBOOK_CARD_MAX_LINES = 45
+MODULE_AGENTS_WARN_LINES = 38
+MODULE_AGENTS_MAX_LINES = 45
+PRIVATE_HOME_PATH_RE = re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+/")
 
 
 HARNESS_BLOCK_RE = re.compile(
@@ -103,6 +119,7 @@ REQUIRED_GITIGNORE_LINES = [
     ".agents/hooks.json",
     ".githooks/",
     "node_modules/",
+    "docs/acceptance/",
 ]
 
 
@@ -178,7 +195,7 @@ def ensure_git_info_exclude(proj: Path, linked_skills: list[str] | tuple = ()):
         excl_file.parent.mkdir(parents=True, exist_ok=True)
         existing = excl_file.read_text(encoding="utf-8", errors="replace").splitlines() if excl_file.is_file() else []
         existing_set = {ln.strip() for ln in existing}
-        entries = [".agents/hooks.json", ".claude/settings.local.json", ".claude/skills"]
+        entries = [".agents/hooks.json", ".claude/settings.local.json", ".claude/skills", "docs/acceptance/"]
         if not has_tracked_files(proj, ".githooks"):
             entries.append(".githooks/")
         entries += [f".agents/skills/{name}" for name in linked_skills]
@@ -1353,6 +1370,307 @@ def dry_run_merge_conflict(main_repo: Path, common_git_dir: Path, base_ref: str,
     return classic.returncode != 0 or b"\n+<<<<<<< " in classic.stdout or classic.stdout.startswith(b"+<<<<<<< ")
 
 
+MAX_LINE_SLOT = 32
+COMPOSE_PORT_DEFAULT_RE = re.compile(r"\$\{[A-Z0-9_]*PORT:-(\d+)\}")
+
+
+def compose_slug(raw: str) -> str:
+    slug = re.sub(r"[^a-z0-9_-]+", "-", raw.lower()).strip("_-")
+    if not slug:
+        return "app"
+    if not slug[0].isalnum():
+        slug = f"p-{slug}"
+    return slug
+
+
+def port_in_use(port: int) -> bool:
+    if port <= 0 or port > 65535:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.15)
+        if probe.connect_ex(("127.0.0.1", port)) == 0:
+            return True
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as binder:
+        try:
+            binder.bind(("127.0.0.1", port))
+        except OSError:
+            return True
+    return False
+
+
+def detect_project_base_ports(main_repo: Path) -> list[int]:
+    raw_env = os.environ.get("WS_DEV_BASE_PORTS", "").strip()
+    if raw_env:
+        return sorted({int(x.strip()) for x in raw_env.split(",") if x.strip().isdigit()})
+    compose_file = main_repo / "deploy" / "compose.yaml"
+    if not compose_file.is_file():
+        return []
+    try:
+        txt = compose_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return sorted({int(m) for m in COMPOSE_PORT_DEFAULT_RE.findall(txt) if 1024 <= int(m) <= 65000})
+
+
+def allocate_line_slot(used_slots: set[int], base_ports: list[int]) -> int:
+    for slot in range(1, MAX_LINE_SLOT + 1):
+        if slot in used_slots:
+            continue
+        if base_ports and any(port_in_use(bp + slot) for bp in base_ports):
+            continue
+        return slot
+    fallback = 1
+    while fallback in used_slots:
+        fallback += 1
+    return fallback
+
+
+def git_ref_sha(repo: Path, ref: str) -> str:
+    res = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", ref],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    )
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def line_needs_distill(
+    main_repo: Path, base_branch: str, branch_name: str, meta: dict, discard: bool = False
+) -> bool:
+    if not branch_name:
+        return False
+    branch_head = git_ref_sha(main_repo, f"refs/heads/{branch_name}")
+    if not branch_head:
+        return False
+    base_head = str(meta.get("base_head") or "")
+    if discard:
+        if not base_head or not git_branch_exists(main_repo, base_branch):
+            return False
+        mb = subprocess.run(
+            ["git", "merge-base", base_branch, branch_name],
+            cwd=str(main_repo),
+            capture_output=True,
+            text=True,
+        )
+        mb_sha = mb.stdout.strip() if mb.returncode == 0 else ""
+        # 已合入主分支的工作即使追加 --discard 仍受沉淀约束；从未合入的废弃分支允许 --discard 直接回收
+        return bool(mb_sha and mb_sha != base_head and mb_sha == branch_head)
+
+    ahead = 0
+    if git_branch_exists(main_repo, base_branch):
+        cnt = subprocess.run(
+            ["git", "rev-list", "--count", f"{base_branch}..{branch_name}"],
+            cwd=str(main_repo),
+            capture_output=True,
+            text=True,
+        )
+        if cnt.returncode == 0:
+            ahead = int(cnt.stdout.strip() or "0")
+    if ahead == 0 and (not base_head or branch_head == base_head):
+        return False
+    return True
+
+
+def is_line_distilled(main_repo: Path, wt_path: Path | None, branch_name: str, meta: dict) -> bool:
+    distilled_head = str(meta.get("distilled_head") or "")
+    if not distilled_head or not branch_name:
+        return False
+    branch_head = git_ref_sha(main_repo, f"refs/heads/{branch_name}")
+    if not branch_head or branch_head != distilled_head:
+        return False
+    if wt_path and wt_path.is_dir():
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(wt_path),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if dirty:
+            return False
+    return True
+
+
+def cleanup_line_preview_containers(repo_name: str, line_name: str) -> bool:
+    """按 ws.repo + ws.line 双标签精准清理该开发线的预览容器、数据卷、网络与本地开发镜像。"""
+    docker_bin = shutil.which("docker")
+    if not docker_bin:
+        return False
+    repo_slug = compose_slug(repo_name)
+    label_filters = ["--filter", f"label=ws.repo={repo_slug}", "--filter", f"label=ws.line={line_name}"]
+    try:
+        ps_res = subprocess.run(
+            [docker_bin, "ps", "-aq", *label_filters],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if ps_res.returncode != 0:
+        return False
+
+    cleaned = False
+    c_ids = ps_res.stdout.split()
+    if c_ids:
+        rm_c = subprocess.run([docker_bin, "rm", "-f", *c_ids], capture_output=True, text=True, timeout=20)
+        if rm_c.returncode != 0:
+            raise WsError(
+                f"清理开发线 `{line_name}` 的预览容器失败（为避免删除挂载目录导致容器异常已中止收线）："
+                f"{rm_c.stderr.strip() or rm_c.stdout.strip()}"
+            )
+        cleaned = True
+
+    vol_res = subprocess.run([docker_bin, "volume", "ls", "-q", *label_filters], capture_output=True, text=True, timeout=8)
+    v_ids = vol_res.stdout.split() if vol_res.returncode == 0 else []
+    if v_ids:
+        rm_v = subprocess.run([docker_bin, "volume", "rm", *v_ids], capture_output=True, text=True, timeout=15)
+        if rm_v.returncode != 0:
+            raise WsError(f"清理开发线 `{line_name}` 的预览数据卷失败：{rm_v.stderr.strip() or rm_v.stdout.strip()}")
+        cleaned = True
+
+    net_res = subprocess.run([docker_bin, "network", "ls", "-q", *label_filters], capture_output=True, text=True, timeout=8)
+    n_ids = net_res.stdout.split() if net_res.returncode == 0 else []
+    if n_ids:
+        subprocess.run([docker_bin, "network", "rm", *n_ids], capture_output=True, text=True, timeout=10)
+
+    for img_tag in (f"{repo_slug}-dev:{line_name}", f"{repo_slug}-web-dev:{line_name}"):
+        subprocess.run([docker_bin, "image", "rm", img_tag], capture_output=True, text=True, timeout=10)
+    return cleaned
+
+
+SLICE_STATUS_LINE_RE = re.compile(
+    r"^\s*-\s*\*\*(?:状态|Status)\*\*\s*[：:]\s*`?([^\s`|]+)`?",
+    re.IGNORECASE | re.MULTILINE,
+)
+UNAPPROVED_SLICE_STATUSES = {
+    "proposed",
+    "draft",
+    "pending",
+    "pending-choice",
+    "options",
+    "brainstorm",
+    "wip-design",
+    "待选择",
+    "待拍板",
+    "草稿",
+}
+APPROVED_SLICE_STATUSES = {
+    "approved",
+    "planned",
+    "ready",
+    "building",
+    "in-progress",
+    "pending-acceptance",
+    "verified",
+    "used",
+    "done",
+}
+
+
+def parse_slice_status(slice_file: Path) -> str:
+    try:
+        txt = slice_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = SLICE_STATUS_LINE_RE.search(txt)
+    return m.group(1).strip() if m else ""
+
+
+def slice_matches_line_name(slice_stem: str, line_name: str) -> bool:
+    s = slice_stem.lower()
+    n = line_name.lower()
+    if s == n or s.startswith(f"{n}-") or s.endswith(f"-{n}"):
+        return True
+    s_num = re.match(r"^(\d+[a-z]?)(?:-|$)", s)
+    n_num = re.match(r"^(\d+[a-z]?)(?:-|$)", n)
+    return bool(s_num and n_num and s_num.group(1) == n_num.group(1))
+
+
+def validate_slice_for_line_new(
+    main_repo: Path, raw_slice: str | None, line_name: str, target_mode: str
+) -> str:
+    """校验编码开发线绑定的切片单是否已落盘且经用户从多方案中选定拍板（approved）。返回规范化相对路径或空串。"""
+    if target_mode != "build":
+        return (raw_slice or "").strip().replace("\\", "/").lstrip("./")
+
+    if raw_slice:
+        rel = raw_slice.strip().replace("\\", "/").lstrip("./")
+        if not rel or ".." in Path(rel).parts:
+            raise WsError(f"不合法的 `--slice` 路径：{raw_slice}")
+        slice_file = (main_repo / rel).resolve()
+        if slice_file == main_repo or main_repo not in slice_file.parents:
+            raise WsError(f"`--slice` 路径必须位于主仓库目录内：{raw_slice}")
+        if not slice_file.is_file():
+            raise WsError(
+                f"开线拦截：指定的切片单 `{rel}` 尚不存在。\n"
+                "标准流程：先站在资深领域架构师视角对标业内最佳实践、点破领域暗坑，给出 2–3 套兼顾业务范围与代码架构的可选方案；"
+                f"待用户明确选定后落盘 `{rel}`（状态标 `approved`），再运行 `ws line new` 开线。"
+            )
+        raw_status = parse_slice_status(slice_file)
+        norm_status = raw_status.lower()
+        if not norm_status or norm_status in UNAPPROVED_SLICE_STATUSES or norm_status not in APPROVED_SLICE_STATUSES:
+            raise WsError(
+                f"开线拦截：切片单 `{rel}` 当前状态为 `{raw_status or '未声明'}`，尚未经用户从多方案比选中拍板选定。\n"
+                "请先向用户呈现 2–3 套融合业内最佳实践与代码架构设计的可选方案；待用户明确拍板后，将切片状态更新为 `approved` 再运行 `ws line new`。"
+            )
+        return rel
+
+    slices_dir = main_repo / "design" / "slices"
+    if slices_dir.is_dir():
+        for cand in sorted(slices_dir.glob("*.md")):
+            if not slice_matches_line_name(cand.stem, line_name):
+                continue
+            cand_rel = cand.relative_to(main_repo).as_posix()
+            raw_status = parse_slice_status(cand)
+            norm_status = raw_status.lower()
+            if not norm_status or norm_status in UNAPPROVED_SLICE_STATUSES or norm_status not in APPROVED_SLICE_STATUSES:
+                raise WsError(
+                    f"开线拦截：检测到匹配的切片单 `{cand_rel}` 当前状态为 `{raw_status or '未声明'}`（未拍板），"
+                    "禁止省略 `--slice` 绕过方案比选门禁抢跑开线。\n"
+                    f"请待用户选定方案并将 `{cand_rel}` 更新为 `approved` 后，使用 `--slice {cand_rel}` 开线。"
+                )
+    return ""
+
+
+def migrate_uncommitted_slice_to_worktree(main_repo: Path, wt_path: Path, slice_rel: str) -> str:
+    """若主仓中的已拍板切片单为未入库新文件或未提交修改，将其同步迁入新工作树并还原主仓干净态，杜绝日后快进合流冲突。"""
+    if not slice_rel:
+        return ""
+    src = main_repo / slice_rel
+    dst = wt_path / slice_rel
+    if not src.is_file():
+        return ""
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", slice_rel],
+        cwd=str(main_repo),
+        capture_output=True,
+    ).returncode == 0
+    if not tracked:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        src.unlink()
+        return f"；已将未入库切片单 `{slice_rel}` 迁入开发线工作树（保持主仓干净免合流冲突）"
+
+    has_diff = subprocess.run(
+        ["git", "diff", "--quiet", "--", slice_rel],
+        cwd=str(main_repo),
+        capture_output=True,
+    ).returncode != 0
+    has_staged = subprocess.run(
+        ["git", "diff", "--cached", "--quiet", "--", slice_rel],
+        cwd=str(main_repo),
+        capture_output=True,
+    ).returncode != 0
+    if has_diff or has_staged:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        subprocess.run(["git", "reset", "-q", "HEAD", "--", slice_rel], cwd=str(main_repo), capture_output=True)
+        subprocess.run(["git", "checkout", "-q", "--", slice_rel], cwd=str(main_repo), capture_output=True)
+        return f"；已将切片单 `{slice_rel}` 的最新拍板修改迁入开发线工作树（恢复主仓干净基线）"
+    return ""
+
+
 def cmd_line_new(args):
     name = args.name.strip()
     if not LINE_NAME_RE.match(name) or name.lower() in RESERVED_LINE_NAMES:
@@ -1373,6 +1691,9 @@ def cmd_line_new(args):
     base_branch = entries[0]["branch"]
     if not base_branch:
         raise WsError(f"主仓库 ({main_repo}) 当前处于游离 HEAD 状态，请先切回主分支（如 main）后再开线。")
+
+    target_mode = args.mode or "build"
+    slice_rel = validate_slice_for_line_new(main_repo, args.slice, name, target_mode)
 
     with acquire_line_lock(common_git_dir):
         entries = parse_worktree_entries(main_repo)
@@ -1403,9 +1724,8 @@ def cmd_line_new(args):
                             )
 
         used_slots = {int(m["slot"]) for m in reg.values() if str(m.get("slot", "")).isdigit()}
-        slot = 1
-        while slot in used_slots:
-            slot += 1
+        slot = allocate_line_slot(used_slots, detect_project_base_ports(main_repo))
+        base_head_sha = git_ref_sha(main_repo, f"refs/heads/{base_branch}") or git_ref_sha(main_repo, "HEAD")
 
         wt_path.parent.mkdir(parents=True, exist_ok=True)
         add_res = subprocess.run(
@@ -1418,14 +1738,14 @@ def cmd_line_new(args):
             raise WsError(f"创建 Git 工作树失败：{add_res.stderr.strip() or add_res.stdout.strip()}")
 
         linked, shared = wire_worktree_harness(main_repo, wt_path)
+        migrated_slice_note = migrate_uncommitted_slice_to_worktree(main_repo, wt_path, slice_rel)
 
         wt_git_dir = resolve_git_dir(wt_path)
         if wt_git_dir is None:
             raise WsError(f"无法解析新工作树 {wt_path} 的 Git 目录。")
-        target_mode = args.mode or "build"
         mode_payload: dict[str, str] = {"mode": target_mode}
-        if args.slice:
-            mode_payload["slice"] = str(args.slice)
+        if slice_rel:
+            mode_payload["slice"] = slice_rel
         (wt_git_dir / LOCAL_MODE_STATE_FILE).write_text(
             json.dumps(mode_payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -1435,7 +1755,9 @@ def cmd_line_new(args):
             "branch": branch_name,
             "path": str(wt_path),
             "base": base_branch,
-            "slice": args.slice or "",
+            "base_head": base_head_sha,
+            "distilled_head": "",
+            "slice": slice_rel,
             "scopes": scopes,
             "allow_overlap": bool(args.allow_overlap),
             "slot": slot,
@@ -1443,14 +1765,64 @@ def cmd_line_new(args):
         }
         write_lines_registry(common_git_dir, reg)
 
-    slice_note = f"，Active-Slice: {args.slice}" if args.slice else ""
+    slice_note = f"，Active-Slice: {slice_rel}" if slice_rel else ""
     scope_note = f"\n  - 独占范围：{', '.join(scopes)}" if scopes else ""
     shared_note = f"；已软链本地配置：{', '.join(shared)}" if shared else ""
     print(f"[{main_repo.name}] 已开启并行开发线 `{name}`（槽位 #{slot}）")
     print(f"  - 工作树目录：{wt_path}（分支 `{branch_name}`，基线 `{base_branch}`）")
-    print(f"  - 本地门禁：Mode: {target_mode}{slice_note}（主仓 AGENTS.md 保持 Mode: {read_agents_mode_of(main_repo)} 零改动）{scope_note}")
+    print(f"  - 本地门禁：Mode: {target_mode}{slice_note}（主仓 AGENTS.md 保持 Mode: {read_agents_mode_of(main_repo)} 零改动）{migrated_slice_note}{scope_note}")
     print(f"  - 环境就绪：已挂载技能 ({len(linked)}) 与三端门禁钩子{shared_note}")
-    print(f"  - 下一步：在该目录开启独立会话开发并 git commit，验收后运行 `ws line sync` 过检合入 `{base_branch}`。")
+    print(
+        f"  - 下一步：在该目录编码过检后拉起 `./scripts/dev` 并弹图文验收报告交用户真机验收（切勿提前合入 `{base_branch}`）；"
+        "获批沉淀后依次运行 `ws line distill` -> `ws line sync` -> `ws line rm`。"
+    )
+    return 0
+
+
+def cmd_line_env(args):
+    probe_dir = Path(args.project_dir or os.getcwd()).expanduser().resolve()
+    main_repo, common_git_dir, entries = resolve_line_context(probe_dir)
+    reg = read_lines_registry(common_git_dir, main_repo, entries)
+    repo_slug = compose_slug(main_repo.name)
+
+    matched_entry: dict | None = None
+    for entry in entries:
+        if probe_dir == entry["path"] or entry["path"] in probe_dir.parents:
+            matched_entry = entry
+            break
+
+    if matched_entry is not None and matched_entry["path"] == main_repo:
+        pairs = [
+            ("WS_LINE_NAME", ""),
+            ("WS_LINE_SLOT", ""),
+            ("WS_MAIN_REPO", str(main_repo)),
+            ("WS_REPO_SLUG", repo_slug),
+            ("WS_COMPOSE_PROJECT", repo_slug),
+        ]
+    else:
+        if matched_entry is None or matched_entry.get("detached"):
+            raise WsError(
+                f"当前目录 ({probe_dir}) 既非主仓库 ({main_repo})，也非已登记的活跃开发线；"
+                "已拒绝导出运行环境以免误占主开发环境。"
+            )
+        name = line_name_from_entry(matched_entry, reg)
+        meta = reg.get(name)
+        if not meta:
+            raise WsError(
+                f"工作树 ({probe_dir}) 未在 `ws line` 登记表中注册；请通过 `ws line new` 创建开发线，避免误占主开发环境。"
+            )
+        slot = str(meta.get("slot") or "1")
+        line_slug = compose_slug(name)
+        pairs = [
+            ("WS_LINE_NAME", name),
+            ("WS_LINE_SLOT", slot),
+            ("WS_MAIN_REPO", str(main_repo)),
+            ("WS_REPO_SLUG", repo_slug),
+            ("WS_COMPOSE_PROJECT", f"{repo_slug}-{line_slug}"),
+        ]
+
+    for key, val in pairs:
+        print(f"{key}={shlex.quote(val)}")
     return 0
 
 
@@ -1497,7 +1869,10 @@ def cmd_line_list(args):
         scope_str = f" | scope={','.join(scopes)}" if scopes else ""
         state_str = f"未完成{in_prog}" if in_prog else ("有未提交改动" if dirty else "工作区干净")
         ab_str = f" | 相对 {eff_base} {ahead_behind}" if ahead_behind else ""
-        print(f"  - {slot_str}{name} [{branch}] Mode:{eff_mode} ({state_str}{ab_str}{slice_str}{scope_str})")
+        distill_str = ""
+        if not entry["detached"] and line_needs_distill(main_repo, eff_base, branch, meta, discard=False):
+            distill_str = " | 已沉淀" if is_line_distilled(main_repo, wt_path, branch, meta) else " | 待验收/未沉淀"
+        print(f"  - {slot_str}{name} [{branch}] Mode:{eff_mode} ({state_str}{ab_str}{distill_str}{slice_str}{scope_str})")
         print(f"    {wt_path}")
     return 0
 
@@ -1640,6 +2015,69 @@ def resolve_sync_target(target_arg: str, project_arg: str) -> tuple[Path, Path, 
     raise WsError("当前位于主仓库目录；请进入开发线工作树运行 `ws line sync`，或指定线名：`ws line sync <name>`。")
 
 
+def cmd_line_distill(args):
+    main_repo, common_git_dir, _, line_name, wt_path, branch_name, meta = resolve_sync_target(
+        args.target, args.project_dir
+    )
+    guard_custom_line_script(main_repo, "distill")
+
+    in_prog = detect_in_progress_git_op(wt_path)
+    if in_prog:
+        raise WsError(f"开发线 `{line_name}` ({wt_path}) 正处于未完成的 Git 操作（{in_prog}），请先解决后再标记沉淀。")
+    if not branch_name:
+        raise WsError(f"开发线 `{line_name}` 处于游离 HEAD 状态，无法登记沉淀凭证。")
+    if not wt_path.is_dir():
+        raise WsError(f"找不到开发线 `{line_name}` 的工作树目录：{wt_path}")
+
+    wt_dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(wt_path),
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if wt_dirty:
+        raise WsError(
+            f"开发线 `{line_name}` 存在未提交的改动，请先将契约/复盘沉淀与代码 `git commit` 后再运行 `ws line distill`。"
+        )
+
+    precious = find_precious_ignored_files(wt_path)
+    if precious:
+        sample = ", ".join(precious[:6]) + (f" 等 {len(precious)} 项" if len(precious) > 6 else "")
+        raise WsError(
+            f"开发线 `{line_name}` 存在仅存于该工作树的本地忽略文件（如临时复现或验收证据）：{sample}\n"
+            "请先将有价值的复现收进正式测试、需保留的报告迁回主目录清理后，再运行 `ws line distill`。"
+        )
+
+    _, learn_warnings, learn_errors = inspect_learning_budget(wt_path)
+    for w in learn_warnings:
+        print(f"  [提示] {w}")
+    if learn_errors:
+        detail = "\n".join(f"  - {err}" for err in learn_errors)
+        raise WsError(f"开发线 `{line_name}` 未通过三级经验飞轮容量或公私分离检查：\n{detail}")
+
+    with acquire_line_lock(common_git_dir):
+        entries = parse_worktree_entries(main_repo)
+        reg = read_lines_registry(common_git_dir, main_repo, entries)
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(wt_path),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        cur_meta = dict(reg.get(line_name, meta))
+        cur_meta["distilled_head"] = head_sha
+        cur_meta["distilled_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if args.note:
+            cur_meta["distill_note"] = args.note.strip()
+        reg[line_name] = cur_meta
+        write_lines_registry(common_git_dir, reg)
+
+    print(f"[{line_name}] 已完成验收收尾沉淀核验并锁定提交 `{head_sha[:8]}`。")
+    print(f"  - 下一步：运行 `ws line sync` 快进合入主分支，随后在主目录运行 `ws line rm {line_name}` 收线。")
+    return 0
+
+
 def cmd_line_sync(args):
     main_repo, common_git_dir, _, line_name, wt_path, branch_name, meta = resolve_sync_target(
         args.target, args.project_dir
@@ -1657,6 +2095,8 @@ def cmd_line_sync(args):
 
     with acquire_line_lock(common_git_dir):
         entries = parse_worktree_entries(main_repo)
+        reg = read_lines_registry(common_git_dir, main_repo, entries)
+        meta = reg.get(line_name, meta)
         base_branch = str(meta.get("base") or entries[0]["branch"] or "main")
 
         if entries[0]["branch"] != base_branch:
@@ -1682,6 +2122,14 @@ def cmd_line_sync(args):
         ).stdout.strip()
         if wt_dirty:
             raise WsError(f"开发线 `{line_name}` ({wt_path}) 存在未提交的改动，请先完成 `git commit` 后再运行 `ws line sync`。")
+
+        pre_sync_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(wt_path),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
 
         anc = subprocess.run(
             ["git", "merge-base", "--is-ancestor", base_branch, "HEAD"],
@@ -1756,6 +2204,13 @@ def cmd_line_sync(args):
         if anc_after.returncode != 0:
             raise WsError(f"门禁检查期间 `{base_branch}` 有新提交合入，请重新运行一次 `ws line sync`。")
 
+        if not args.skip_distill and str(meta.get("distilled_head") or "") != pre_sync_head:
+            raise WsError(
+                f"开发线 `{line_name}` 尚未登记真人验收后的收尾沉淀（或沉淀登记后又有新提交），已阻断提前合入 `{base_branch}`。\n"
+                f"标准流程：先在该开发线运行 `./scripts/dev` 并生成图文验收报告交用户真机确认「验收通过」，"
+                f"落盘契约/经验沉淀并提交后执行 `ws line distill {line_name}`，再运行 `ws line sync`。"
+            )
+
         ff = subprocess.run(
             ["git", "merge", "--ff-only", branch_name],
             cwd=str(main_repo),
@@ -1765,7 +2220,18 @@ def cmd_line_sync(args):
         if ff.returncode != 0:
             raise WsError(f"快进合入 `{base_branch}` 失败：{ff.stderr.strip() or ff.stdout.strip()}")
 
-        print(f"[{line_name}] 已通过门禁并快进合入 `{base_branch}`（共 {ahead} 个提交）。")
+        post_sync_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(wt_path),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        if line_name in reg and not args.skip_distill:
+            reg[line_name]["distilled_head"] = post_sync_head
+            write_lines_registry(common_git_dir, reg)
+
+        print(f"[{line_name}] 已通过门禁与沉淀核验，快进合入 `{base_branch}`（共 {ahead} 个提交）。")
         print(f"  - 若本开发线已交付完结，可在主目录运行 `ws line rm {line_name}` 收线清理。")
     return 0
 
@@ -1863,12 +2329,27 @@ def cmd_line_rm(args):
                             label = f"游离提交 `{ref[:8]}`" if wt_entry and ref == wt_entry.get("head") else f"分支 `{ref}`"
                             problems.append(f"{label} 仍有 {unmerged} 个提交未合入 `{base_branch}`（请先合入或确认丢弃）")
 
+        if has_branch and line_needs_distill(main_repo, base_branch, branch_name, meta, discard=args.discard):
+            br_head = git_ref_sha(main_repo, f"refs/heads/{branch_name}")
+            if not br_head or str(meta.get("distilled_head") or "") != br_head:
+                problems.append(
+                    f"开发线 `{canonical_name}` 尚未完成收线沉淀登记（请先完成知识与复盘沉淀后运行 `ws line distill {canonical_name}`）"
+                )
+
         if problems and not args.discard:
             detail = "\n".join(f"  - {p}" for p in problems)
             raise WsError(
                 f"拒绝收掉开发线 `{canonical_name}`：\n{detail}\n"
-                "处理：先合入提交并迁出需保留的本地文件；若确认全部丢弃，请显式追加 `--discard`。"
+                "处理：先完成沉淀登记并合入提交、迁出需保留的本地文件；若确认丢弃未合并分支，请显式追加 `--discard`。"
             )
+        if problems and args.discard:
+            # 即使带 --discard，若该开发线已有提交合入基线但漏做沉淀，同样提示阻断防漏沉淀删线
+            merged_undistilled = [p for p in problems if "尚未完成收线沉淀登记" in p]
+            if merged_undistilled:
+                detail = "\n".join(f"  - {p}" for p in merged_undistilled)
+                raise WsError(f"拒绝收掉已合入主分支但未完成沉淀的开发线 `{canonical_name}`：\n{detail}")
+
+        cleaned_preview = cleanup_line_preview_containers(main_repo.name, canonical_name)
 
         if wt_path and wt_path.exists():
             rm_res = subprocess.run(
@@ -1901,7 +2382,8 @@ def cmd_line_rm(args):
             del reg[canonical_name]
             write_lines_registry(common_git_dir, reg)
 
-    print(f"[{main_repo.name}] 已收掉开发线 `{canonical_name}`（工作树与分支 `{branch_name}` 已清理完毕）。")
+    env_note = "、预览容器与数据卷" if cleaned_preview else ""
+    print(f"[{main_repo.name}] 已收掉开发线 `{canonical_name}`（工作树{env_note}与分支 `{branch_name}` 已清理完毕）。")
     return 0
 
 
@@ -2032,6 +2514,126 @@ def cmd_map(args):
         raise WsError(str(exc)) from exc
 
 
+def count_nonempty_lines(path: Path) -> int:
+    return sum(1 for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip())
+
+
+def find_module_agents_files(proj: Path) -> list[Path]:
+    skip_dirs = {
+        ".git", "node_modules", ".next", "dist", "build", "out", "coverage",
+        "__pycache__", ".venv", "venv", "vendor", "third_party", "target",
+    }
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(proj, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if d not in skip_dirs and not d.startswith("."))
+        cur = Path(dirpath)
+        if cur == proj:
+            continue
+        if "AGENTS.md" in filenames:
+            found.append(cur / "AGENTS.md")
+    return sorted(found)
+
+
+def inspect_learning_budget(proj: Path | None) -> tuple[list[str], list[str], list[str]]:
+    """返回 (status_lines, warnings, errors)。"""
+    pb_dir = get_playbooks_dir()
+    status_lines: list[str] = ["=== 1. 母仓跨项目错法模式卡（Tier 2 Playbooks）水位 ==="]
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    idx_file = pb_dir / "INDEX.md"
+    if not idx_file.is_file():
+        errors.append(f"缺少错法模式卡索引文件：{idx_file}")
+        status_lines.append(f"  [ERR] 缺少 INDEX.md ({idx_file})")
+    else:
+        idx_txt = idx_file.read_text(encoding="utf-8", errors="replace")
+        idx_lines = count_nonempty_lines(idx_file)
+        cards = sorted(p for p in pb_dir.glob("*.md") if p.name != "INDEX.md")
+        idx_tag = "OK" if idx_lines <= PLAYBOOKS_INDEX_MAX_LINES else "OVER"
+        cnt_tag = "OK" if len(cards) <= PLAYBOOKS_MAX_CARDS else "OVER"
+        status_lines.append(f"  [{idx_tag}] INDEX.md: {idx_lines}/{PLAYBOOKS_INDEX_MAX_LINES} 非空行")
+        status_lines.append(f"  [{cnt_tag}] 错法卡数量: {len(cards)}/{PLAYBOOKS_MAX_CARDS} 张")
+        if idx_lines > PLAYBOOKS_INDEX_MAX_LINES:
+            errors.append(f"INDEX.md 非空行数超限（{idx_lines} > {PLAYBOOKS_INDEX_MAX_LINES}）")
+        if len(cards) > PLAYBOOKS_MAX_CARDS:
+            errors.append(
+                f"母仓错法卡数量超限（{len(cards)} > {PLAYBOOKS_MAX_CARDS}）：请合并同类卡，或将成熟错法毕业编译进 harness/guards/ 后退役旧卡"
+            )
+        if PRIVATE_HOME_PATH_RE.search(idx_txt):
+            errors.append("INDEX.md 含本机私有用户目录路径，违反母仓公私分离红线")
+
+        for card in cards:
+            c_txt = card.read_text(encoding="utf-8", errors="replace")
+            c_lines = count_nonempty_lines(card)
+            in_index = card.name in idx_txt
+            c_tag = "OK" if (c_lines <= PLAYBOOK_CARD_MAX_LINES and in_index) else "ERR"
+            note = "" if in_index else "（未登记在 INDEX.md）"
+            status_lines.append(f"    - [{c_tag}] {card.name}: {c_lines}/{PLAYBOOK_CARD_MAX_LINES} 非空行{note}")
+            if c_lines > PLAYBOOK_CARD_MAX_LINES:
+                errors.append(f"错法卡 {card.name} 非空行数超限（{c_lines} > {PLAYBOOK_CARD_MAX_LINES}）")
+            if not in_index:
+                errors.append(f"错法卡 {card.name} 未登记在 INDEX.md 路由表中")
+            if PRIVATE_HOME_PATH_RE.search(c_txt):
+                errors.append(f"错法卡 {card.name} 含本机私有用户目录路径，违反母仓公私分离红线")
+
+    if proj is not None and proj.is_dir() and proj != HUB_ROOT:
+        status_lines.append(f"\n=== 2. 项目模块就近契约（Tier 1 Module AGENTS.md）水位：{proj.name} ===")
+        mod_files = find_module_agents_files(proj)
+        if not mod_files:
+            status_lines.append("  （当前尚未创建子模块 AGENTS.md）")
+        for mf in mod_files:
+            rel = mf.relative_to(proj).as_posix()
+            n_lines = count_nonempty_lines(mf)
+            if n_lines > MODULE_AGENTS_MAX_LINES:
+                tag = "OVER"
+                errors.append(f"{rel} 非空行数超硬上限（{n_lines} > {MODULE_AGENTS_MAX_LINES}）")
+            elif n_lines >= MODULE_AGENTS_WARN_LINES:
+                tag = "WARN"
+                warnings.append(f"{rel} 已用 {n_lines}/{MODULE_AGENTS_MAX_LINES} 行：建议将成熟文字条目毕业为 Tier 3 自动检查或共用件")
+            else:
+                tag = "OK"
+            status_lines.append(f"  [{tag}] {rel}: {n_lines}/{MODULE_AGENTS_MAX_LINES} 非空行")
+
+    return status_lines, warnings, errors
+
+
+def cmd_learn(args):
+    learn_args = list(getattr(args, "learn_args", []) or [])
+    action = "status"
+    proj_raw = ""
+    if learn_args:
+        if learn_args[0] in ("status", "check"):
+            action = learn_args[0]
+            proj_raw = learn_args[1] if len(learn_args) > 1 else ""
+            if len(learn_args) > 2:
+                raise WsError("参数过多。用法：`ws learn [status|check] [project_dir]`。")
+        else:
+            proj_raw = learn_args[0]
+            if len(learn_args) > 1:
+                raise WsError("参数不合法。用法：`ws learn [status|check] [project_dir]`。")
+
+    proj: Path | None = None
+    if proj_raw:
+        proj = Path(proj_raw).expanduser().resolve()
+        if not proj.is_dir():
+            raise WsError(f"找不到项目目录：{proj}")
+    elif Path.cwd().resolve() != HUB_ROOT and (Path.cwd() / "AGENTS.md").is_file():
+        proj = Path.cwd().resolve()
+
+    lines, warnings, errors = inspect_learning_budget(proj)
+    print("\n".join(lines))
+    for w in warnings:
+        print(f"  [提示] {w}")
+    if errors:
+        for err in errors:
+            print(f"  [拦截] {err}", file=sys.stderr)
+        if action == "check":
+            return 1
+    elif action == "check":
+        print("经验飞轮容量与公私分离检查通过。")
+    return 0
+
+
 def cmd_doctor(args):
     ok = True
     print("=== 1. 母仓核心组件体检 ===")
@@ -2044,6 +2646,8 @@ def cmd_doctor(args):
         ("Prototype Checker", PROTO_CHECKER),
         ("Prototype Dev Overlay", OVERLAY_RUNTIME),
         ("Charter Block", CHARTER_FILE),
+        ("Acceptance Report Template", ACCEPTANCE_REPORT_TPL),
+        ("Playbooks Index", get_playbooks_dir() / "INDEX.md"),
     ]:
         exists = path.is_file()
         ok = ok and exists
@@ -2162,14 +2766,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_mode.add_argument("--clear-local", action="store_true", help="清除当前 Git 工作树的本地 Mode 覆盖，恢复继承 AGENTS.md")
     p_mode.set_defaults(func=cmd_mode)
 
-    p_line = sub.add_parser("line", help="管理基于 git worktree 的多需求并行开发线（new/list/check/sync/rm）", allow_abbrev=False)
+    p_line = sub.add_parser(
+        "line",
+        help="管理基于 git worktree 的多需求并行开发线（new/list/env/check/distill/sync/rm）",
+        allow_abbrev=False,
+    )
     line_sub = p_line.add_subparsers(dest="line_cmd", required=True)
 
-    p_line_list = line_sub.add_parser("list", help="列出当前项目所有活跃的并行开发线与状态", allow_abbrev=False)
+    p_line_list = line_sub.add_parser("list", help="列出当前项目所有活跃的并行开发线与沉淀状态", allow_abbrev=False)
     p_line_list.add_argument("project_dir", nargs="?", default="", help="项目路径（省略则默认当前目录）")
     p_line_list.set_defaults(func=cmd_line_list)
 
-    p_line_new = line_sub.add_parser("new", help="基于主分支开启独立工作树开发线（自动挂本地 build 模式、软链与钩子）", allow_abbrev=False)
+    p_line_env = line_sub.add_parser("env", help="导出当前目录所属主仓或开发线的环境变量（供 scripts/dev 分配槽位端口）", allow_abbrev=False)
+    p_line_env.add_argument("project_dir", nargs="?", default="", help="目标目录（省略则默认当前目录）")
+    p_line_env.set_defaults(func=cmd_line_env)
+
+    p_line_new = line_sub.add_parser("new", help="基于主分支开启独立工作树开发线（自动探活槽位、挂本地 build 模式、软链与钩子）", allow_abbrev=False)
     p_line_new.add_argument("name", help="开发线短名称（如 01a-overlays，创建分支 line/<name>）")
     p_line_new.add_argument("project_dir", nargs="?", default="", help="项目路径（省略则默认当前目录）")
     p_line_new.add_argument("--slice", default=None, help="绑定当前开发线的 Active-Slice 路径")
@@ -2182,10 +2794,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_line_chk.add_argument("project_dir", nargs="?", default="", help="项目路径（省略则默认当前目录）")
     p_line_chk.set_defaults(func=cmd_line_check)
 
-    p_line_sync = line_sub.add_parser("sync", help="变基跟上主分支、执行门禁检查并快进合入主分支", allow_abbrev=False)
+    p_line_distill = line_sub.add_parser("distill", help="真人验收通过并落盘沉淀后，核验经验水位并锁定当前提交以解锁合流", allow_abbrev=False)
+    p_line_distill.add_argument("target", nargs="?", default="", help="开发线名称或路径（在开发线目录内运行时可省略）")
+    p_line_distill.add_argument("project_dir", nargs="?", default="", help="可选主项目路径")
+    p_line_distill.add_argument("--note", default="", help="本次验收结论与知识沉淀摘要备注")
+    p_line_distill.set_defaults(func=cmd_line_distill)
+
+    p_line_sync = line_sub.add_parser("sync", help="变基跟上主分支、核验门禁与验收沉淀凭证并快进合入主分支", allow_abbrev=False)
     p_line_sync.add_argument("target", nargs="?", default="", help="开发线名称或路径（在开发线目录内运行时可省略）")
     p_line_sync.add_argument("project_dir", nargs="?", default="", help="可选主项目路径（从项目外按线名合入时使用）")
     p_line_sync.add_argument("--skip-check", action="store_true", help="跳过合入前的门禁脚本检查（仍强制扫描密钥）")
+    p_line_sync.add_argument("--skip-distill", action="store_true", help="跳过验收沉淀登记校验（需经用户批准）")
     p_line_sync.set_defaults(func=cmd_line_sync)
 
     p_line_rm = line_sub.add_parser("rm", help="安全收掉已合流的开发线（清理工作树与本地分支）", allow_abbrev=False)
@@ -2221,6 +2840,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_prom.add_argument("target_dir", help="目标新仓库路径")
     p_prom.add_argument("--name", default="", help="新项目显示名称")
     p_prom.set_defaults(func=cmd_promote)
+
+    p_learn = sub.add_parser(
+        "learn",
+        usage="ws learn [status|check] [project_dir]",
+        help="查看或核验母仓错法模式卡（playbooks/）与项目模块契约水位",
+        allow_abbrev=False,
+    )
+    p_learn.add_argument("learn_args", nargs="*", metavar="ARGS", help="status（默认）或 check，及可选项目路径")
+    p_learn.set_defaults(func=cmd_learn)
 
     p_doc = sub.add_parser("doctor", help="检查母仓与项目三端挂载健康度", allow_abbrev=False)
     p_doc.add_argument("project_dir", nargs="?", default="", help="可选业务项目路径")
