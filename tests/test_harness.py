@@ -1083,6 +1083,25 @@ class HarnessTestSuite(unittest.TestCase):
         )
         self.assertEqual(json.loads(agy_scratch.stdout)["decision"], "allow")
 
+        # 8) 误传命令行参数（如 --map）且 stdin 保持打开未发 EOF 时，必须毫秒级报错退出，绝不挂起阻塞后台任务
+        proc = subprocess.Popen(
+            ["python3", str(READ_GUARD), "--map", str(engine_file)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.env,
+        )
+        try:
+            rc = proc.wait(timeout=2)
+            err = proc.stderr.read() if proc.stderr else ""
+        finally:
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream and not stream.closed:
+                    stream.close()
+        self.assertEqual(rc, 2)
+        self.assertIn("ws map", err)
+
     def test_15_worktree_local_mode_state_isolation(self):
         proj = self.tmp_path / "multi-line-app"
         proj.mkdir()

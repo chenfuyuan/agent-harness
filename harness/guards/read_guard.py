@@ -240,6 +240,18 @@ def evaluate_read(req: ReadRequest, cwd: str) -> tuple[str, str]:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 or sys.stdin.isatty():
+        ws_bin = Path(__file__).resolve().parents[2] / "bin" / "ws"
+        msg = (
+            f"用法说明：`read_guard.py` 是仅从标准输入读取 JSON 的 PreToolUse 钩子脚本，不接受命令行参数（收到：{sys.argv[1:]}）。\n"
+            f"若需生成目录或文件的 AST 符号骨架地图，请运行：`{ws_bin} map <路径>`。"
+        )
+        if any(a in ("-h", "--help") for a in sys.argv[1:]):
+            print(msg)
+            return 0
+        print(msg, file=sys.stderr)
+        return 2
+
     raw = sys.stdin.read().strip()
     if not raw:
         return 0
