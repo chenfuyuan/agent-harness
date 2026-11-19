@@ -70,11 +70,16 @@
 #!/bin/sh
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# 1. 运行项目自身单测、集成测试与类型检查（按技术栈替换）
-# pnpm --dir "$ROOT" test
-# 2. 串联母仓统一门禁，并在全量通过后签发跨工作树共享代码树硬凭证（--record-full；存量仓日常增量可省去该参数并加 --diff）
 HUB="${WS_HUB_ROOT:-$(awk -F '\140' '/Hub-Ref[*]*[ ]*:/{print $2; exit}' "$ROOT/AGENTS.md")}"
 case "$HUB" in "~/"*) HUB="$HOME/${HUB#"~/"}" ;; /*) ;; *) HUB="$ROOT/$HUB" ;; esac
+# 1. 全量模式优先查跨工作树共享凭证（同一份非文档代码已跑通全量免重复等，加 --force 强制重跑）
+if [ "${1:-}" != "--force" ] && "$HUB/bin/ws" check "$ROOT" --full-covered >/dev/null 2>&1; then
+  "$HUB/bin/ws" check "$ROOT"
+  exit 0
+fi
+# 2. 运行项目自身单测、集成测试与类型检查（建议配失败快停 --ff --maxfail=10、耗时剖析开关与动态并发；纯内存 --unit 零 DB 起步）
+# pnpm --dir "$ROOT" test
+# 3. 串联母仓统一门禁，全量通过后签发跨工作树共享代码树硬凭证（--record-full；存量仓日常增量可省去并加 --diff）
 "$HUB/bin/ws" check "$ROOT" --record-full
 # 注：在打标/上线脚本（如 scripts/release）中加一行 `"$HUB/bin/ws" check "$ROOT" --verify-full HEAD` 即可秒级核验本机全量凭证。
 ```

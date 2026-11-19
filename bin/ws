@@ -6,7 +6,8 @@
   ws mode <design|build> [project_dir] [--slice <path>] [--local]    切换阶段门禁（支持 --local 工作树本地覆盖）
   ws line <new|list|env|check|distill|sync|rm> ...                   管理基于 git worktree 的多需求并行开发线与验收门禁
   ws map [target] [--max-lines <N>] [--depth <N>]                    生成目录或文件的 AST 符号与章节行号骨架地图
-  ws check [project_dir] [--diff] [--record-full | --verify-full]    运行质量与安全门禁，签发或核验跨工作树共享全量代码树凭证
+  ws check [project_dir] [--diff] [--record-full | --verify-full | --full-covered]
+                                                                     运行质量与安全门禁，签发或核验跨工作树共享全量代码树凭证
   ws link [project_dir]                                              修复或重连软链接、原型胶囊与三端钩子
   ws sync [project_dir]                                              同步母仓最新技能、宪章区块与原型胶囊至业务仓
   ws promote <idea> <target_dir> [--name <名称>]                     将 sandbox/<idea> 脑暴成果毕业迁出为正式业务仓
@@ -934,6 +935,20 @@ def verify_full_check_receipt(proj: Path, rev: str) -> int:
     )
 
 
+def is_worktree_full_covered(proj: Path) -> int:
+    common_dir = resolve_common_git_dir_for(proj)
+    if common_dir is None:
+        return 1
+    try:
+        digest = worktree_code_digest(proj)
+    except WsError:
+        return 1
+    if digest in set(read_full_receipts(common_dir)):
+        print(f"[{proj.name}] 当前工作区代码已在本机通过全量门禁（{digest[:12]}），可免重跑。")
+        return 0
+    return 1
+
+
 def run_ws_check_on(proj: Path, diff: bool = False, base_ref: str = "") -> int:
     eff_base = (base_ref or os.environ.get("WS_CHECK_BASE", "")).strip()
     # 阶段门禁事后核对：Mode: design 下工作区不应出现 design/ 白名单之外的改动（不依赖任何工具钩子，三端通用）
@@ -965,12 +980,15 @@ def cmd_check(args):
         return 1
     rec_full = bool(getattr(args, "record_full", False))
     ver_full = getattr(args, "verify_full", None)
-    if rec_full and ver_full is not None:
-        raise WsError("`--record-full` 与 `--verify-full` 不能同时使用。")
-    if rec_full and bool(args.diff):
-        raise WsError("`--record-full` 用于签发全量门禁凭证，不能与增量 `--diff` 同时使用。")
+    full_cov = bool(getattr(args, "full_covered", False))
+    if sum(bool(x) for x in (rec_full, ver_full is not None, full_cov)) > 1:
+        raise WsError("`--record-full`、`--verify-full` 与 `--full-covered` 只能三选一。")
+    if (rec_full or full_cov) and bool(args.diff):
+        raise WsError("`--record-full` / `--full-covered` 仅用于全量门禁凭证，不能与增量 `--diff` 同时使用。")
     if ver_full is not None:
         return verify_full_check_receipt(proj, str(ver_full))
+    if full_cov:
+        return is_worktree_full_covered(proj)
     rc = run_ws_check_on(proj, diff=bool(args.diff), base_ref=str(getattr(args, "base", "") or ""))
     if rc == 0 and rec_full:
         digest = worktree_code_digest(proj)
@@ -2825,6 +2843,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_chk.add_argument("--base", default="", help="指定增量与历史提交密钥扫描的基线分支/引用（如 main）")
     p_chk.add_argument("--record-full", action="store_true", help="全量通过后在 Git 公共目录签发跨工作树共享代码树硬凭证")
     p_chk.add_argument("--verify-full", nargs="?", const="HEAD", default=None, metavar="REV", help="核验指定提交（默认 HEAD）是否已签发本机全量代码树凭证")
+    p_chk.add_argument("--full-covered", action="store_true", help="核验当前工作区非文档代码树是否已在本机签发全量门禁凭证（命中返 0，未命中返 1）")
     p_chk.set_defaults(func=cmd_check)
 
     p_link = sub.add_parser("link", help="修复或重连三端技能软链接、胶囊与钩子", allow_abbrev=False)

@@ -33,7 +33,7 @@ description: >-
 1. **工程骨架与静态守卫兑现**：若为 L1 轻量工具尚未建 `TECH.md`，先补齐精简版 `design/TECH.md`；按 `TECH.md` 建立单向依赖目录分层（如纯计算 `domain/` 与 `infra/` 物理隔离）及分层静态检查规则。
 2. **三件套脚本与零容器云端节流到位**：
    - `scripts/dev`：一键启动应用；接入 `<Hub-Ref>/bin/ws line env`，在并行开发线运行时自动使用槽位偏移端口（`BASE + slot`）与独立容器项目名 `<proj>-<line>`（容器/卷统一打标 `ws.repo=<proj>`、`ws.line=<line>`），默认共用主开发环境真实数据（配合**持久化表结构只加不删**铁律，1 秒开线免空库盲测）；
-   - `scripts/check`：一键串联项目纯内存单测/集成测试 + 架构分层守卫 + `<Hub-Ref>/bin/ws check`（全量通过时追加 `--record-full` 签发跨工作树共享代码树硬凭证；打版本/发布脚本前置 `<Hub-Ref>/bin/ws check --verify-full HEAD` 锁死未验代码）；
+   - `scripts/check`：一键串联项目纯内存单测/集成测试 + 架构分层守卫（含纯内存单测禁连 DB/嵌入式数据湖）+ `<Hub-Ref>/bin/ws check`（全量入口先查 `--full-covered` 跨工作树复用已验凭证、`--force` 强制重跑，全量通过后 `--record-full` 签发凭证；配 `--ff --maxfail=10` 与剖析开关；打版本/发布脚本前置 `--verify-full HEAD` 锁死未验代码）；
    - **云端 CI（若配置 `.github/workflows/check.yml`）**：严格遵循 [templates.md](./references/templates.md) 的**“本机全量凭证 + 云端 <1 分钟零容器底线”**模式，仅在 `push tags: ["v*"]`、`pull_request`、`workflow_dispatch` 触发并开启 `concurrency` 取消旧跑，**严禁在 `push: branches: ["**"]` 上重复跑重型容器测试双倍消耗免费配额**；
    - **日常真用入口打通**：把用户本机每天打开它的真实方式（Docker Compose / 本地常驻服务 / 快捷命令）当场装好跑通。
 

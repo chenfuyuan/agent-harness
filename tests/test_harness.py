@@ -1507,13 +1507,18 @@ class HarnessTestSuite(unittest.TestCase):
         self.run_cmd(["git", "add", "AGENTS.md"], cwd=proj)
         self.assertEqual(self.run_cmd(["git", "commit", "-m", "lock design"], cwd=proj).returncode, 0)
 
-        # 1) 未签发全量凭证前，--verify-full 必须拦截；--diff 与 --record-full 互斥拦截
+        # 1) 未签发全量凭证前，--verify-full 与 --full-covered 必须拦截；互斥参数必须拦截
         unverified = self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--verify-full"])
         self.assertNotEqual(unverified.returncode, 0)
         self.assertIn("尚未在本机签发全量门禁凭证", unverified.stderr)
 
+        uncovered = self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--full-covered"])
+        self.assertNotEqual(uncovered.returncode, 0)
+
         diff_conflict = self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--diff", "--record-full"])
         self.assertNotEqual(diff_conflict.returncode, 0)
+        cov_conflict = self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--record-full", "--full-covered"])
+        self.assertNotEqual(cov_conflict.returncode, 0)
 
         # 2) 在并行开发线中修改代码、签发全量凭证、合入主仓、收掉开发线，并在主仓追加纯文档/设计提交：凭证依然有效
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "new", "feat-ci", str(proj)]).returncode, 0)
@@ -1521,6 +1526,8 @@ class HarnessTestSuite(unittest.TestCase):
         (wt / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
         rec_ok = self.run_cmd(["python3", str(WS_BIN), "check", str(wt), "--record-full"])
         self.assertEqual(rec_ok.returncode, 0, rec_ok.stdout + rec_ok.stderr)
+        wt_cov = self.run_cmd(["python3", str(WS_BIN), "check", str(wt), "--full-covered"])
+        self.assertEqual(wt_cov.returncode, 0, wt_cov.stdout + wt_cov.stderr)
         self.run_cmd(["git", "add", "-A"], cwd=wt)
         self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: value 2"], cwd=wt).returncode, 0)
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill", "feat-ci"], cwd=proj).returncode, 0)
@@ -1531,16 +1538,23 @@ class HarnessTestSuite(unittest.TestCase):
         (proj / "docs" / "progress.md").write_text("# 进度沉淀\n", encoding="utf-8")
         (proj / "design" / "SYSTEM.md").write_text("# 骨架\n", encoding="utf-8")
         (proj / "README.md").write_text("# 说明\n", encoding="utf-8")
+        # 未提交的纯文档改动不影响 --full-covered 命中
+        doc_dirty_cov = self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--full-covered"])
+        self.assertEqual(doc_dirty_cov.returncode, 0, doc_dirty_cov.stdout + doc_dirty_cov.stderr)
         self.run_cmd(["git", "add", "-A"], cwd=proj)
         self.assertEqual(self.run_cmd(["git", "commit", "-m", "docs: distill"], cwd=proj).returncode, 0)
         self.run_cmd(["git", "tag", "-a", "v1.0.0", "-m", "v1.0.0"], cwd=proj)
 
         ver_ok = self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--verify-full", "HEAD"])
         self.assertEqual(ver_ok.returncode, 0, ver_ok.stdout + ver_ok.stderr)
+        main_cov = self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--full-covered"])
+        self.assertEqual(main_cov.returncode, 0, main_cov.stdout + main_cov.stderr)
 
         # 3) 源码树内的业务 prompt/*.md 属于运行时代码而非纯文档：修改后未重签凭证必须拦截，而历史标签 v1.0.0 仍有效
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "mode", "build", str(proj)]).returncode, 0)
         (proj / "src" / "prompts" / "ask.md").write_text("System prompt v2\n", encoding="utf-8")
+        dirty_code_cov = self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--full-covered"])
+        self.assertNotEqual(dirty_code_cov.returncode, 0)
         self.run_cmd(["git", "add", "-A"], cwd=proj)
         self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: prompt v2"], cwd=proj).returncode, 0)
 

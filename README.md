@@ -64,8 +64,9 @@ python3 tests/test_harness.py
 # 3. 按需生成目录或大文件的 AST 类/函数/章节行号骨架图（省上下文防盲读）
 ./bin/ws map ~/code/my-app/src
 
-# 4. 开发期运行全套质量与安全门禁；全量通过后签发共享代码树凭证，发版前秒级核验（配合云端零容器节流 CI）
+# 4. 开发期运行全套质量与安全门禁；全量通过后签发共享代码树凭证，同代码免重跑、发版前秒级核验（配合云端零容器节流 CI）
 ./bin/ws check ~/code/my-app --record-full
+./bin/ws check ~/code/my-app --full-covered
 ./bin/ws check ~/code/my-app --verify-full HEAD
 
 # 5. 查看与校验模块契约及母仓错法模式卡（playbooks/）经验水位
