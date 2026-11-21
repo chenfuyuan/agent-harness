@@ -14,7 +14,7 @@
 1. **通用引擎与私有实例解耦**：母仓只沉淀零业务硬编码的通用技能（Skills）、安全与质量门禁（Guards）及同步工具（`bin/ws`），可无缝赋能个人工具、商业 SaaS、开源库或团队协作项目。
 2. **单项目仓闭环，零跨仓搬运税**：产品研发项目在同一仓库内包含 `design/`（系统骨架 + 视觉基因 + 个性化原型 + 切片工单）与 `src/`（生产代码），由 **`Mode: design | build` 阶段门禁**（事前拦截 + 事后工作区核对 + 提交兜底，见下方“三道防线”）防止讨论阶段抢跑误改业务代码。
 3. **零模板个性化原型先行**：彻底废除固定“左侧栏后台外壳”；根据业务本质选空间拓扑、做主屏视觉比稿，沉淀专属 `design/DESIGN.md` 与 `tokens.css` 持续指导后续真实前端还原。
-4. **顺应 AI 特性的工程防护**：单技能软链接零拷贝共享；模块采用就近契约 `src/<mod>/AGENTS.md`（≤40 行）；内置多语言 AST 代码骨架地图（`ws map`）与双端大文件吞读守卫（`read_guard.py`）防上下文膨胀压缩；真数据探针由子代理隔离试错；内置工作区密钥扫描、反 `TODO/mock` 假实现拦截与零上下文 Diff 审查。
+4. **顺应 AI 特性的确定性工程防护（Checks over Notes）**：单技能软链接零拷贝共享；模块公开入口、单向分层禁令与高危 API 封禁统一收口在项目根 `.harness-rules.json`，由 `harness_guard.py` 全仓强执（同时拦截裸 `@ts-ignore`/`# type: ignore`/`# noqa` 消音、未备案 `TODO/mock` 与过期 `stub-ok` 占位债）；仅复杂核心模块按需维护极薄 `src/<mod>/AGENTS.md`（≤20 行 / 硬上限 25 行）；内置多语言 AST 代码骨架地图（`ws map`）与双端大文件吞读守卫（`read_guard.py`）；支持信任阶梯双车道（`ws line new --lane full|fast`）、属性自验证与零上下文 Diff 审查。
 
 ---
 
@@ -53,9 +53,10 @@ python3 tests/test_harness.py
 ./bin/ws init ~/code/my-app --name "示例应用"
 # （或在新建的项目目录内直接运行：ws init --name "示例应用"）
 
-# 2. 原型拍板后解锁首片地基；首提锁基线后切回 design 并用 ws line 开启多需求并行开发线
+# 2. 原型拍板后解锁首片地基；首提锁基线后切回 design 并用 ws line 开启双车道并行开发线
 ./bin/ws mode build ~/code/my-app --slice design/slices/00-foundation.md
 ./bin/ws line new 01-order ~/code/my-app --slice design/slices/01-order.md --scope src/orders
+./bin/ws line new fix-calc ~/code/my-app --lane fast --scope src/domain
 ./bin/ws line list ~/code/my-app
 ./bin/ws line check ~/code/my-app
 ./bin/ws line sync 01-order ~/code/my-app

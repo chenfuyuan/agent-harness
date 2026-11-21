@@ -45,7 +45,7 @@ MODE_GUARD = HUB_ROOT / "harness" / "guards" / "mode_guard.py"
 READ_GUARD = HUB_ROOT / "harness" / "guards" / "read_guard.py"
 CODE_OUTLINE = HUB_ROOT / "harness" / "guards" / "code_outline.py"
 SECRETS_GUARD = HUB_ROOT / "harness" / "guards" / "check_secrets.py"
-ANTI_STUB_GUARD = HUB_ROOT / "harness" / "guards" / "check_anti_stub.py"
+HARNESS_GUARD = HUB_ROOT / "harness" / "guards" / "harness_guard.py"
 PROTO_CHECKER = HUB_ROOT / "harness" / "guards" / "check_prototype.mjs"
 
 
@@ -67,8 +67,8 @@ def get_playbooks_dir() -> Path:
 PLAYBOOKS_INDEX_MAX_LINES = 35
 PLAYBOOKS_MAX_CARDS = 10
 PLAYBOOK_CARD_MAX_LINES = 45
-MODULE_AGENTS_WARN_LINES = 38
-MODULE_AGENTS_MAX_LINES = 45
+MODULE_AGENTS_WARN_LINES = 20
+MODULE_AGENTS_MAX_LINES = 25
 PRIVATE_HOME_PATH_RE = re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+/")
 
 
@@ -960,16 +960,16 @@ def run_ws_check_on(proj: Path, diff: bool = False, base_ref: str = "") -> int:
         sec_cmd.extend(["--base", eff_base])
     sec_res = subprocess.run(sec_cmd, cwd=str(proj))
 
-    stub_cmd = [sys.executable, str(ANTI_STUB_GUARD), str(proj)]
+    guard_cmd = [sys.executable, str(HARNESS_GUARD), str(proj)]
     if diff:
-        stub_cmd.append("--diff")
+        guard_cmd.append("--diff")
     if eff_base:
-        stub_cmd.extend(["--base", eff_base])
-    stub_res = subprocess.run(stub_cmd, cwd=str(proj))
+        guard_cmd.extend(["--base", eff_base])
+    guard_res = subprocess.run(guard_cmd, cwd=str(proj))
 
-    if gate_res.returncode != 0 or sec_res.returncode != 0 or stub_res.returncode != 0:
+    if gate_res.returncode != 0 or sec_res.returncode != 0 or guard_res.returncode != 0:
         return 1
-    print(f"[{proj.name}] 全量门禁检查通过（阶段门禁核对 + 密钥扫描 + 反假实现 + 模块契约边界）。")
+    print(f"[{proj.name}] 全量门禁检查通过（阶段门禁核对 + 密钥扫描 + 代码园丁护栏）。")
     return 0
 
 
@@ -1711,6 +1711,7 @@ def cmd_line_new(args):
         raise WsError(f"主仓库 ({main_repo}) 当前处于游离 HEAD 状态，请先切回主分支（如 main）后再开线。")
 
     target_mode = args.mode or "build"
+    lane = getattr(args, "lane", None) or "full"
     slice_rel = validate_slice_for_line_new(main_repo, args.slice, name, target_mode)
 
     with acquire_line_lock(common_git_dir):
@@ -1775,6 +1776,7 @@ def cmd_line_new(args):
             "base": base_branch,
             "base_head": base_head_sha,
             "distilled_head": "",
+            "lane": lane,
             "slice": slice_rel,
             "scopes": scopes,
             "allow_overlap": bool(args.allow_overlap),
@@ -1784,16 +1786,24 @@ def cmd_line_new(args):
         write_lines_registry(common_git_dir, reg)
 
     slice_note = f"，Active-Slice: {slice_rel}" if slice_rel else ""
+    lane_label = "快车道 fast（免方案比选与 HTML 截图，仅限纯重构/补测/规则收紧/局部小 Bug）" if lane == "fast" else "重验收 full"
     scope_note = f"\n  - 独占范围：{', '.join(scopes)}" if scopes else ""
     shared_note = f"；已软链本地配置：{', '.join(shared)}" if shared else ""
-    print(f"[{main_repo.name}] 已开启并行开发线 `{name}`（槽位 #{slot}）")
+    print(f"[{main_repo.name}] 已开启并行开发线 `{name}`（槽位 #{slot}，车道：{lane}）")
     print(f"  - 工作树目录：{wt_path}（分支 `{branch_name}`，基线 `{base_branch}`）")
+    print(f"  - 信任车道：{lane_label}")
     print(f"  - 本地门禁：Mode: {target_mode}{slice_note}（主仓 AGENTS.md 保持 Mode: {read_agents_mode_of(main_repo)} 零改动）{migrated_slice_note}{scope_note}")
     print(f"  - 环境就绪：已挂载技能 ({len(linked)}) 与三端门禁钩子{shared_note}")
-    print(
-        f"  - 下一步：在该目录编码过检后拉起 `./scripts/dev` 并弹图文验收报告交用户真机验收（切勿提前合入 `{base_branch}`）；"
-        "获批沉淀后依次运行 `ws line distill` -> `ws line sync` -> `ws line rm`。"
-    )
+    if lane == "fast":
+        print(
+            f"  - 下一步（快车道）：跑绿全量门禁 + 属性/回归测试 + 零上下文审查 0 Blocker，向用户呈现一屏验收摘要确认后，"
+            "依次运行 `ws line distill` -> `ws line sync` -> `ws line rm`（严禁借快车道偷塞新 UI 或破坏数据正本）。"
+        )
+    else:
+        print(
+            f"  - 下一步：在该目录编码过检后拉起 `./scripts/dev` 并弹图文验收报告交用户真机验收（切勿提前合入 `{base_branch}`）；"
+            "获批沉淀后依次运行 `ws line distill` -> `ws line sync` -> `ws line rm`。"
+        )
     return 0
 
 
@@ -1882,6 +1892,7 @@ def cmd_line_list(args):
                 behind_n, ahead_n = ab.stdout.split()
                 ahead_behind = f"+{ahead_n}/-{behind_n}"
         slot_str = f"#{meta['slot']} " if meta.get("slot") else ""
+        lane_str = f" | lane={meta['lane']}" if meta.get("lane") == "fast" else ""
         slice_str = f" | slice={eff_slice}" if eff_slice else ""
         scopes = meta.get("scopes") or []
         scope_str = f" | scope={','.join(scopes)}" if scopes else ""
@@ -1890,7 +1901,7 @@ def cmd_line_list(args):
         distill_str = ""
         if not entry["detached"] and line_needs_distill(main_repo, eff_base, branch, meta, discard=False):
             distill_str = " | 已沉淀" if is_line_distilled(main_repo, wt_path, branch, meta) else " | 待验收/未沉淀"
-        print(f"  - {slot_str}{name} [{branch}] Mode:{eff_mode} ({state_str}{ab_str}{distill_str}{slice_str}{scope_str})")
+        print(f"  - {slot_str}{name} [{branch}] Mode:{eff_mode} ({state_str}{ab_str}{distill_str}{lane_str}{slice_str}{scope_str})")
         print(f"    {wt_path}")
     return 0
 
@@ -2595,22 +2606,72 @@ def inspect_learning_budget(proj: Path | None) -> tuple[list[str], list[str], li
                 errors.append(f"错法卡 {card.name} 含本机私有用户目录路径，违反母仓公私分离红线")
 
     if proj is not None and proj.is_dir() and proj != HUB_ROOT:
+        audit_res = subprocess.run(
+            [sys.executable, str(HARNESS_GUARD), str(proj), "--audit-json"],
+            capture_output=True,
+            text=True,
+            cwd=str(proj),
+        )
+        audit = json.loads(audit_res.stdout) if (audit_res.returncode == 0 and audit_res.stdout.strip()) else None
+
         status_lines.append(f"\n=== 2. 项目模块就近契约（Tier 1 Module AGENTS.md）水位：{proj.name} ===")
-        mod_files = find_module_agents_files(proj)
-        if not mod_files:
-            status_lines.append("  （当前尚未创建子模块 AGENTS.md）")
-        for mf in mod_files:
-            rel = mf.relative_to(proj).as_posix()
-            n_lines = count_nonempty_lines(mf)
+        if audit is not None and isinstance(audit.get("module_agents"), list):
+            mod_entries = [(item["file"], int(item["lines"])) for item in audit["module_agents"]]
+        else:
+            mod_entries = [(mf.relative_to(proj).as_posix(), count_nonempty_lines(mf)) for mf in find_module_agents_files(proj)]
+        if not mod_entries:
+            status_lines.append("  （当前尚未创建子模块 AGENTS.md；简单模块无需建文件，机械边界优先写入 .harness-rules.json）")
+        for rel, n_lines in mod_entries:
             if n_lines > MODULE_AGENTS_MAX_LINES:
                 tag = "OVER"
                 errors.append(f"{rel} 非空行数超硬上限（{n_lines} > {MODULE_AGENTS_MAX_LINES}）")
             elif n_lines >= MODULE_AGENTS_WARN_LINES:
                 tag = "WARN"
-                warnings.append(f"{rel} 已用 {n_lines}/{MODULE_AGENTS_MAX_LINES} 行：建议将成熟文字条目毕业为 Tier 3 自动检查或共用件")
+                warnings.append(f"{rel} 已用 {n_lines}/{MODULE_AGENTS_MAX_LINES} 行：建议将机械约束毕业至 .harness-rules.json 并删旧字")
             else:
                 tag = "OK"
             status_lines.append(f"  [{tag}] {rel}: {n_lines}/{MODULE_AGENTS_MAX_LINES} 非空行")
+
+        status_lines.append(f"\n=== 3. 项目代码硬防线（Tier 3 .harness-rules.json）与豁免债水位：{proj.name} ===")
+        if audit is None:
+            errors.append(f"运行代码园丁审计失败：{audit_res.stderr.strip() or audit_res.stdout.strip()}")
+            status_lines.append("  [ERR] 无法获取 Tier 3 规则与豁免债审计结果")
+        else:
+            if audit.get("rules_file"):
+                rc = audit.get("rules_counts", {})
+                r_errs = audit.get("rules_errors") or []
+                r_tag = "ERR" if r_errs else "OK"
+                status_lines.append(
+                    f"  [{r_tag}] {audit['rules_file']}: 忽略 {rc.get('ignore_paths', 0)} / 公开入口 {rc.get('public_entries', 0)} / "
+                    f"分层禁令 {rc.get('layer_bans', 0)} / 禁式规则 {rc.get('pattern_bans', 0)}"
+                )
+                errors.extend(r_errs)
+            else:
+                status_lines.append("  [INFO] 尚未配置 `.harness-rules.json`（成熟分层与反模式规则可随时毕业写入，30 秒升格为 Tier 3 硬门禁）")
+
+            exemptions = audit.get("exemptions") or []
+            stale_stubs = audit.get("stale_stubs") or []
+            if not exemptions:
+                status_lines.append("  [OK] 生产代码豁免债：0 处")
+            else:
+                counts: dict[str, int] = {}
+                for ex in exemptions:
+                    counts[ex["kind"]] = counts.get(ex["kind"], 0) + 1
+                summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+                ex_tag = "OVER" if stale_stubs else "INFO"
+                status_lines.append(f"  [{ex_tag}] 生产代码豁免债共 {len(exemptions)} 处（{summary}）")
+                for ex in exemptions[:8]:
+                    extra = f" ({ex['detail']})" if ex.get("detail") else ""
+                    stale_mark = f" [过期: {ex['stale_slice']['slice']}={ex['stale_slice']['status']}]" if ex.get("stale_slice") else ""
+                    status_lines.append(f"    - {ex['file']}:{ex['line']} [{ex['kind']}]{extra}{stale_mark}")
+                if len(exemptions) > 8:
+                    status_lines.append(f"    ... 其余 {len(exemptions) - 8} 处豁免请定期审查清偿")
+
+            for st in stale_stubs:
+                si = st["stale_slice"]
+                errors.append(
+                    f"过期占位债 {st['file']}:{st['line']} `stub-ok({st['detail']})` -> 关联切片 `{si['slice']}` 已为 `{si['status']}`，请清理占位并补齐真实实现"
+                )
 
     return status_lines, warnings, errors
 
@@ -2660,7 +2721,7 @@ def cmd_doctor(args):
         ("Read Guard", READ_GUARD),
         ("Code Outline (AST Map)", CODE_OUTLINE),
         ("Secrets Guard", SECRETS_GUARD),
-        ("Anti-Stub & Boundary Guard", ANTI_STUB_GUARD),
+        ("Harness Guard (Code Gardener)", HARNESS_GUARD),
         ("Prototype Checker", PROTO_CHECKER),
         ("Prototype Dev Overlay", OVERLAY_RUNTIME),
         ("Charter Block", CHARTER_FILE),
@@ -2803,6 +2864,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_line_new.add_argument("name", help="开发线短名称（如 01a-overlays，创建分支 line/<name>）")
     p_line_new.add_argument("project_dir", nargs="?", default="", help="项目路径（省略则默认当前目录）")
     p_line_new.add_argument("--slice", default=None, help="绑定当前开发线的 Active-Slice 路径")
+    p_line_new.add_argument("--lane", choices=["full", "fast"], default="full", help="信任阶梯车道：full（重验收档，默认）或 fast（快车道：纯重构/补测/规则收紧/局部小 Bug）")
     p_line_new.add_argument("--scope", nargs="+", default=None, help="声明本线独占修改目录（防撞检查）")
     p_line_new.add_argument("--allow-overlap", action="store_true", help="允许与在跑开发线的声明范围重叠")
     p_line_new.add_argument("--mode", choices=["build", "design"], default="build", help="工作树初始本地模式（默认 build）")
@@ -2837,7 +2899,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_map.add_argument("--depth", type=int, default=4, help="目录递归最大深度（默认 4）")
     p_map.set_defaults(func=cmd_map)
 
-    p_chk = sub.add_parser("check", help="运行阶段门禁核对 + 密钥扫描 + 反假实现 + 模块契约边界检查", allow_abbrev=False)
+    p_chk = sub.add_parser("check", help="运行阶段门禁核对 + 密钥扫描 + 代码园丁护栏（分层/禁式/裸消音/反假实现/豁免债）", allow_abbrev=False)
     p_chk.add_argument("project_dir", nargs="?", default="", help="项目路径（默认当前目录）")
     p_chk.add_argument("--diff", action="store_true", help="对占位符与空异常启用增量检查（适合存量仓）")
     p_chk.add_argument("--base", default="", help="指定增量与历史提交密钥扫描的基线分支/引用（如 main）")

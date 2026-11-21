@@ -1,11 +1,14 @@
 <!-- HARNESS:START (由 agent-harness/bin/ws 自动维护，请勿手改此区块) -->
 ## 双模态工作流宪章（Design ↔ Build）
 
-1. **阶段门禁与并行开线流转（硬约束）**：
-   - **0→1 新仓与新大模块（`Mode: design`）**：严禁创建、修改或删除 `design/` 以外的业务代码，严禁 AI 擅自篡改钩子或自改 `Mode` 解锁；仅在用户拍板原型与切片范围后，经用户确认解锁编码（尚无提交的 `Slice 00` 在主目录执行 `ws mode build --slice <path>`，首提锁基线后切回 `ws mode design` 守门）。
-   - **1→N 功能切片与多线并行（`ws line` 头尾双真人把关）**：有 `main` 基线提交后，主目录默认保持干净 `Mode: design`（只做设计与合流，确保 `main` 始终为真人已验收的可随时发版基线）。**【开工前必选方案】每次开启下一阶段切片或新功能需求前（纯局部明确 Bug 修复除外），必须站在资深领域架构师视角先点破领域暗坑、对标业内顶级开源与工程最佳实践，在对话正文给出 2–3 套兼顾业务范围与代码架构设计的可选方案（首推项标 `（推荐）`），当轮停下等用户选定拍板（严禁未获选择同轮抢跑开线）**；获选后将方案落盘至切片单（状态标 `approved`），再通过 `<Hub-Ref>/bin/ws line new <name> --slice <path>`（若项目自带 `scripts/line` 则优先用项目脚本）开独立工作树编码。**【合流前必真机验收】跑通门禁与对抗审查后，仅在该开发线拉起预览环境（`scripts/dev`）并生成 HTML 图文验收报告自动弹浏览器交用户真机验收，严禁未经用户明确回复「验收通过」提前合入 `main`**；获批后先在开发线落盘沉淀并执行 `ws line distill` 锁死提交，再执行 `ws line sync` 过检快进合入 `main`、`ws line rm` 销毁预览容器并收线。单线轻量修 Bug 也可保持 `build` 直改，但**凡触及新增子系统、全新独立视图或变更权威数据正本**，必须先停下提醒切回 `ws mode design`。
-2. **最小上下文接续与漏斗式读取**：新会话先读本文件 → `design/SYSTEM.md`（及 `Mode: build` 下的 `design/TECH.md`）→ 当前 `Active-Slice` 指向的切片文件直接汇报接续点；摸底陌生目录先跑 `<Hub-Ref>/bin/ws map <dir>` 或 `rg -n` 定位再并行按行段精读（`read_guard` 自动拦截 >400 行无行号整本吞读并返回 AST 骨架）；跨目录盲找 >8 个未知文件时派只读子代理隔离噪音（单子代理 ≤15 文件），即将修改的代码与核心算式须由主会话亲读原文。
-3. **业务设计、原型与工程架构探索（`Mode: design`）**：按 `explore-architect` 锁业务骨架 `design/SYSTEM.md`，按 `bespoke-prototype` 定制 `design/DESIGN.md`、`tokens.css` 与零构建个性化交互原型（纯后端/数据项目可跳过，**严禁套用千篇一律的左侧栏后台模板**），再按 `tech-architect` 拆解业内顶级开源代码架构与工程模式（如奖章数据管道、状态机、同构内核）产出 `design/TECH.md`。
-4. **AI 原生切片开发、治本排障与自进化（`Mode: build`）**：正向开发按 `slice-build` 推进（开工前必经领域架构师多方案比选与真数据探针，对照 `<Hub-Ref>/harness/playbooks/INDEX.md` 防坑，**严禁跳过代码架构设计直接照着原型图画皮**）；表结构坚持**只加不删**以支持开发线安全共用主开发数据；核心模块维护 ≤40 行（硬上限 45 非空行）就近契约 `src/<mod>/AGENTS.md`，源码文件头仅写 1–2 行职责（禁手写函数清单）；算钱/算指标逻辑先写手算测试；遇到报错、卡慢或 AI/并发偶发异常必先按 `systematic-debugging` 做零改动取证（偶发问题用原始报文录带回放定格）与「治本四校」，严禁打症状消音浅补丁；跑绿 `scripts/check` 并经 `adversarial-review` 零上下文审 Diff 后部署开发线 `dev` 交真人验收，获批收尾按 `compound-learn`（配合 `<Hub-Ref>/bin/ws learn` 与 `ws line distill`）走三级飞轮沉淀后再合流收线。
+1. **阶段门禁与信任阶梯并行开线（硬约束）**：
+   - **0→1 新仓与新大模块（`Mode: design`）**：严禁读写 `design/` 以外业务代码、严禁 AI 篡改钩子或自解锁；拍板原型与首片后解锁编码（无提交首片在主目录 `ws mode build --slice <path>`，首提锁基线后切回 `ws mode design` 守门）。
+   - **1→N 双车道并行开发（`ws line` 主仓常驻 `design`，按风险分流）**：
+     - **重验收档（`--lane full`，默认）**：适用于新功能、UI 变更、数据正本或资金风控改动。**开工前**须以领域架构师视角点破暗坑、对标业内最佳实践，给出 2–3 套「业务范围 × 代码架构」方案（推荐置顶）并停下等用户选定，落盘切片单（`approved`）后开线 `ws line new <name> --slice <path>`；**合流前**过全量门禁与零上下文审查，拉起 `scripts/dev` 并弹 HTML 图文验收报告经用户真机回复「验收通过」，再依次 `ws line distill` → `ws line sync` → `ws line rm`。
+     - **快车道档（`--lane fast`）**：仅限**纯内部重构、补测试、收紧 `.harness-rules.json` 规则或局部小 Bug 治本修复**（严禁偷塞新 UI 或改数据正本）。免多方案比选与 HTML 截图仪式，直接 `ws line new <name> --lane fast`；跑绿全量门禁 + 属性/回归测试 + 零上下文审查 `0 Blocker` 后，向用户呈现一屏验收摘要确认，再依次 `distill` → `sync` → `rm`。
+     - 凡触及新增子系统、全新视图或变更权威数据正本，必须切回 `ws mode design`。
+2. **最小上下文接续与漏斗式读取**：新会话先读本文件 → `design/SYSTEM.md`（及 `build` 态的 `design/TECH.md`、`.harness-rules.json`）→ `Active-Slice` 汇报接续点；摸底先跑 `<Hub-Ref>/bin/ws map <dir>` 或 `rg -n` 再按行段精读（`read_guard` 自动拦截 >400 行盲读）；跨目录盲找 >8 个未知文件派只读子代理（≤15 文件），将改代码须主会话亲读原文。
+3. **业务探索、个性化原型与工程架构（`Mode: design`）**：按 `explore-architect`（模糊/流程自动化需求先反向采访剥离目标与工序、明确 Anti-Job）锁 `design/SYSTEM.md`，按 `bespoke-prototype` 定制 `DESIGN.md`、`tokens.css` 与零构建原型（纯后端/数据跳过，禁套后台模板），按 `tech-architect` 拆解标杆代码架构产出 `design/TECH.md` 并在 `Slice 00` 解锁 `build` 时将分层与高危 API 禁令落盘至项目根 `.harness-rules.json`。
+4. **确定性花园编码、治本排障与 Checks-over-Notes 进化（`Mode: build`）**：按 `slice-build` 推进（表结构只加不删；分层依赖、公开入口与高危 API 封禁统一收口至 `.harness-rules.json` 由 `ws check` 硬拦，全仓禁裸 `@ts-ignore`/`# type: ignore`/`# noqa` 消音；仅复杂核心模块按需留 ≤20 行 / 硬上限 25 行 `src/<mod>/AGENTS.md` 写纯业务不变量，源码头禁写函数清单；算账与状态机配手算 TDD + 属性测试，严守最小改动半径）；排障按 `systematic-debugging` 零改动取证、录带回放与「治本四校」；收尾按 `compound-learn` 将反复踩坑 30 秒毕业进 `.harness-rules.json` 并删除旧口头叮嘱，同时经 `ws learn` 清偿豁免债与过期 `stub-ok`。
 5. **沟通与安全**：中文沟通，底层实现琐事（变量命名、微调间距等双向门）不打扰用户；**每次新需求/下一阶段方案比选与架构单向门**在正文讲清领域本质、业内标杆做法、代码架构映射与利弊取舍（推荐置顶）后请用户文字拍板；用户附带新疑问时先评审收敛再改代码。严禁密钥入库，未经明确指令不自动 `git commit/push`、不执行真实资金操作。
 <!-- HARNESS:END -->

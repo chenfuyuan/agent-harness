@@ -24,11 +24,11 @@ description: >-
 
 | 层级 | 落点位置 | 适用范围与唤醒机制 | 硬容量与淘汰规则 |
 | :--- | :--- | :--- | :--- |
-| **Tier 1：模块就近记忆** | 项目 `src/<mod>/AGENTS.md` | 仅跟当前业务模块强相关的不变量与边界坑点；读写该目录文件时按路径自动唤醒，其他模块 **0 Token 消耗** | 硬上限 **45 非空行**；接近上限时必须将成熟条目提纯或升级至 Tier 3 |
+| **Tier 1：模块极薄备忘** | 项目 `src/<mod>/AGENTS.md`（仅复杂核心模块按需建） | 仅放机器静态规则拦不住的纯业务不变量与单测命令；读写该目录按路径唤醒，其他模块 **0 Token 消耗** | 建议 ≤20 行，硬上限 **25 非空行**；公开入口与机械禁区一律移入 `.harness-rules.json` |
 | **Tier 2：跨项目错法卡** | 母仓 `<Hub-Ref>/harness/playbooks/Fxx-<slug>.md` | 跨项目通用的高频工程反模式（**严禁混入私有业务表名、本机路径或密钥**）；开发与排障时扫 `INDEX.md` 按场景点读 | `INDEX.md` ≤ **35 非空行**，总卡 ≤ **10 张**，单卡 ≤ **45 非空行**；满额须合并或毕业旧卡 |
-| **Tier 3：代码硬防线（终极毕业）** | 母仓 `harness/guards/`、项目架构检查或 `core` 共用件 | **事不过二铁律**：同一类错出现 **第 2 次**，或第一次出现但能用静态规则/共用原语 100% 拦住的错，必须写成自动报错检查或共用封装 | **毕业即删字**：一旦代码门禁生效，立即从 Tier 1 / Tier 2 删掉对应口头叮嘱，永不腐烂 |
+| **Tier 3：代码硬防线（首选终极毕业）** | 项目根 **`.harness-rules.json`**（30 秒零摩擦毕业）、母仓 `harness/guards/` 或 `core` 共用件 | **Checks over Notes 铁律**：凡纠错后追问“下次 AI 再犯谁先拦住”，答案若是人，立刻升级为硬检查——分层越界/禁高危 API 直接加 3 行规则入 `.harness-rules.json`，跨项目通用错法进 `harness_guard.py` | **毕业即删字 + 清豁免债**：硬防线生效后立刻删掉 Tier 1 / Tier 2 旧口头叮嘱；`ws learn check` 同时硬拦已结项切片残留的过期 `stub-ok` |
 
 ## 3. 标准沉淀动作流（与开发线验收闭环联动）
 
-1. **查水位与附草稿**：运行 `<Hub-Ref>/bin/ws learn status [project_dir]` 查看各模块 `AGENTS.md` 与母仓 `playbooks/` 行数预算；在开发线提交《真人验收报告》时，一并附上 **3–5 行**拟沉淀草稿（Tier 1 / 2 / 3，老错重犯直接提议 Tier 3 自动检查或共用件），不在真人验收前提前合入 `main`。
-2. **确认后落盘并锁死 `distilled_head`**：待用户回复「验收通过」后，结合审查拦截项与用户真机反馈在开发线写入对应文件并提交，运行 `<Hub-Ref>/bin/ws line distill`（内部自动调用 `ws learn check` 核验容量硬顶与公私分离，并签发 `distilled_head` 解锁 `ws line sync` 合入；若改了母仓则加跑 `python3 <Hub-Ref>/tests/test_harness.py` 与 `ws sync`）。
+1. **查水位、盘豁免债与附草稿**：运行 `<Hub-Ref>/bin/ws learn status [project_dir]` 一屏查看 Tier 1 行数、Tier 2 错法卡、Tier 3 `.harness-rules.json` 规则数及全仓豁免债（`stub-ok`/`ignore-ok`/`boundary-ok`/`rule-ok`）；在交付验收（`full` 图文报告或 `fast` 一屏摘要）时一并附上 **3–5 行**拟沉淀草稿（优先提议 3 行 `.harness-rules.json` 规则），不在用户确认前提前合入 `main`。
+2. **确认后落盘并锁死 `distilled_head`**：待用户回复确认后，在开发线写入规则/沉淀并清理过期占位后提交，运行 `<Hub-Ref>/bin/ws line distill`（内部自动调用 `ws learn check` 核验容量硬顶、规则合法性、过期 `stub-ok` 与公私分离，并签发 `distilled_head` 解锁 `ws line sync`；若改了母仓则加跑 `python3 <Hub-Ref>/tests/test_harness.py` 与 `ws sync`）。

@@ -18,7 +18,7 @@ WS_BIN = HUB / "bin" / "ws"
 MODE_GUARD = HUB / "harness" / "guards" / "mode_guard.py"
 READ_GUARD = HUB / "harness" / "guards" / "read_guard.py"
 SECRETS_GUARD = HUB / "harness" / "guards" / "check_secrets.py"
-ANTI_STUB = HUB / "harness" / "guards" / "check_anti_stub.py"
+HARNESS_GUARD = HUB / "harness" / "guards" / "harness_guard.py"
 PROTO_CHECKER = HUB / "harness" / "guards" / "check_prototype.mjs"
 
 
@@ -477,15 +477,15 @@ class HarnessTestSuite(unittest.TestCase):
         self.run_cmd(["git", "commit", "-m", "legacy baseline"], cwd=proj)
 
         # 全量模式拦截老 TODO，--diff 增量模式放行未改动老文件
-        self.assertEqual(self.run_cmd(["python3", str(ANTI_STUB), str(proj)]).returncode, 1)
-        self.assertEqual(self.run_cmd(["python3", str(ANTI_STUB), str(proj), "--diff"]).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(HARNESS_GUARD), str(proj)]).returncode, 1)
+        self.assertEqual(self.run_cmd(["python3", str(HARNESS_GUARD), str(proj), "--diff"]).returncode, 0)
 
         # 1) 多行 Python except ...:\n pass 必须检出
         (proj / "backend" / "handler.py").write_text(
             "def run():\n    try:\n        work()\n    except Exception as exc:\n        # silent\n        pass\n",
             encoding="utf-8",
         )
-        py_catch_fail = self.run_cmd(["python3", str(ANTI_STUB), str(proj), "--diff"])
+        py_catch_fail = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj), "--diff"])
         self.assertEqual(py_catch_fail.returncode, 1)
         self.assertIn("except", py_catch_fail.stderr)
         (proj / "backend" / "handler.py").unlink()
@@ -504,7 +504,7 @@ class HarnessTestSuite(unittest.TestCase):
             "export function click() { try { go(); } catch (e) { /* noop */ } }\n",
             encoding="utf-8",
         )
-        js_fail = self.run_cmd(["python3", str(ANTI_STUB), str(proj), "--diff"])
+        js_fail = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj), "--diff"])
         self.assertEqual(js_fail.returncode, 1)
         self.assertIn("TODO", js_fail.stderr)
         self.assertIn("catch", js_fail.stderr)
@@ -515,7 +515,7 @@ class HarnessTestSuite(unittest.TestCase):
             "export function click() { return placeOrder(); }\n",
             encoding="utf-8",
         )
-        boundary_fail = self.run_cmd(["python3", str(ANTI_STUB), str(proj), "--diff"])
+        boundary_fail = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj), "--diff"])
         self.assertEqual(boundary_fail.returncode, 1)
         self.assertIn("越权", boundary_fail.stderr)
 
@@ -526,12 +526,12 @@ class HarnessTestSuite(unittest.TestCase):
             "export function click() { return placeOrder(); }\n",
             encoding="utf-8",
         )
-        clean_res = self.run_cmd(["python3", str(ANTI_STUB), str(proj), "--diff"])
+        clean_res = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj), "--diff"])
         self.assertEqual(clean_res.returncode, 0, clean_res.stderr)
 
         # 4) 契约里的入口不加反引号也要解析对（曾被解析成末尾字符 `s`，导致合法导入全报越权）
         (orders_dir / "AGENTS.md").write_text("# Module: orders\n- 唯一公开入口: ./index.ts\n", encoding="utf-8")
-        bare_entry = self.run_cmd(["python3", str(ANTI_STUB), str(proj), "--diff"])
+        bare_entry = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj), "--diff"])
         self.assertEqual(bare_entry.returncode, 0, bare_entry.stderr)
 
         # 5) 行号与豁免都落在 import 所在行：前面有 export 语句时 `boundary-ok` 仍然生效
@@ -540,12 +540,12 @@ class HarnessTestSuite(unittest.TestCase):
             f"export const VERSION = 1;\n{deep_import} // boundary-ok 迁移期豁免\nexport const go = () => placeOrder();\n",
             encoding="utf-8",
         )
-        waived = self.run_cmd(["python3", str(ANTI_STUB), str(proj), "--diff"])
+        waived = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj), "--diff"])
         self.assertEqual(waived.returncode, 0, waived.stderr)
         (ui_dir / "ticket.ts").write_text(
             f"export const VERSION = 1;\n{deep_import}\nexport const go = () => placeOrder();\n", encoding="utf-8"
         )
-        unwaived = self.run_cmd(["python3", str(ANTI_STUB), str(proj), "--diff"])
+        unwaived = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj), "--diff"])
         self.assertEqual(unwaived.returncode, 1)
         self.assertIn("src/ui/ticket.ts:2:", unwaived.stderr)
 
@@ -554,7 +554,7 @@ class HarnessTestSuite(unittest.TestCase):
             "export async function go() { const m = await import('../orders/internal/repo'); return m.placeOrder(); }\n",
             encoding="utf-8",
         )
-        dynamic = self.run_cmd(["python3", str(ANTI_STUB), str(proj), "--diff"])
+        dynamic = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj), "--diff"])
         self.assertEqual(dynamic.returncode, 1)
         self.assertIn("越权", dynamic.stderr)
         (ui_dir / "ticket.ts").unlink()
@@ -563,7 +563,7 @@ class HarnessTestSuite(unittest.TestCase):
         pkg_dir = proj / "myapp"
         pkg_dir.mkdir()
         (pkg_dir / "pricing.py").write_text("def price():\n    raise NotImplementedError\n", encoding="utf-8")
-        not_impl = self.run_cmd(["python3", str(ANTI_STUB), str(proj), "--diff"])
+        not_impl = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj), "--diff"])
         self.assertEqual(not_impl.returncode, 1)
         self.assertIn("myapp/pricing.py:2:", not_impl.stderr)
         (pkg_dir / "pricing.py").write_text(
@@ -571,7 +571,7 @@ class HarnessTestSuite(unittest.TestCase):
             "    @abstractmethod\n    def price(self):\n        raise NotImplementedError\n",
             encoding="utf-8",
         )
-        abstract_ok = self.run_cmd(["python3", str(ANTI_STUB), str(proj), "--diff"])
+        abstract_ok = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj), "--diff"])
         self.assertEqual(abstract_ok.returncode, 0, abstract_ok.stderr)
         self.assertRegex(abstract_ok.stdout, r"已扫描 \d+ 个源码文件")
 
@@ -579,7 +579,7 @@ class HarnessTestSuite(unittest.TestCase):
         empty_proj = self.tmp_path / "empty-repo"
         (empty_proj / "design").mkdir(parents=True)
         (empty_proj / "design" / "sketch.js").write_text("// TODO: 原型草稿不属于生产代码\n", encoding="utf-8")
-        empty_res = self.run_cmd(["python3", str(ANTI_STUB), str(empty_proj)])
+        empty_res = self.run_cmd(["python3", str(HARNESS_GUARD), str(empty_proj)])
         self.assertEqual(empty_res.returncode, 0, empty_res.stderr)
         self.assertIn("未发现可扫描的源码文件", empty_res.stdout)
 
@@ -1574,12 +1574,12 @@ class HarnessTestSuite(unittest.TestCase):
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "init", str(proj), "--mode", "build"]).returncode, 0)
         (proj / "src" / "orders").mkdir(parents=True)
         (proj / "src" / "orders" / "AGENTS.md").write_text(
-            "\n".join(f"- rule {i}" for i in range(40)) + "\n",
+            "\n".join(f"- rule {i}" for i in range(21)) + "\n",
             encoding="utf-8",
         )
         st = self.run_cmd(["python3", str(WS_BIN), "learn", "status", str(proj)])
         self.assertEqual(st.returncode, 0, st.stderr)
-        self.assertIn("[WARN] src/orders/AGENTS.md: 40/45 非空行", st.stdout)
+        self.assertIn("[WARN] src/orders/AGENTS.md: 21/25 非空行", st.stdout)
 
         # 3) WS_PLAYBOOKS_DIR 隔离验证：未登记卡、超行数卡、私有路径泄露与 >10 张卡均被 ws learn check 硬拦
         pb_tmp = self.tmp_path / "playbooks"
@@ -1662,7 +1662,7 @@ class HarnessTestSuite(unittest.TestCase):
         (wt / "src" / "ui" / "view.py").write_text("VIEW = 1\n", encoding="utf-8")
         self.assertNotEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt).returncode, 0)
 
-        (wt / "src" / "ui" / "AGENTS.md").write_text("\n".join(f"- r{i}" for i in range(47)) + "\n", encoding="utf-8")
+        (wt / "src" / "ui" / "AGENTS.md").write_text("\n".join(f"- r{i}" for i in range(27)) + "\n", encoding="utf-8")
         self.run_cmd(["git", "add", "-A"], cwd=wt)
         self.assertEqual(self.run_cmd(["git", "commit", "--no-verify", "-m", "wip over limit"], cwd=wt).returncode, 0)
         over_dist = self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt)
@@ -1701,6 +1701,216 @@ class HarnessTestSuite(unittest.TestCase):
 
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill", "feat-ui", str(proj)]).returncode, 0)
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "rm", "feat-ui", str(proj)]).returncode, 0)
+
+    def test_21_harness_guard_rules_silencers_stale_stubs_and_fast_lane(self):
+        proj = self.tmp_path / "gardener-app"
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "init", str(proj), "--mode", "build"]).returncode, 0)
+        for rel_d in ("src/domain", "src/infra", "src/orders/internal", "src/ui", "src/framework", "design/slices"):
+            (proj / rel_d).mkdir(parents=True, exist_ok=True)
+
+        # 1) 损坏的 `.harness-rules.json` 与危险 ignore_paths（越界/全仓逃逸）必须 fail-closed 拦截
+        (proj / ".harness-rules.json").write_text("{bad json", encoding="utf-8")
+        bad_rules = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj)])
+        self.assertEqual(bad_rules.returncode, 1)
+        self.assertIn("JSON 解析失败", bad_rules.stderr)
+
+        for bad_ign in (["../outside/**"], ["{a,../b}/**"], ["/etc/**"], ["**"], ["**/*"], ["*/**"], ["*/*"]):
+            (proj / ".harness-rules.json").write_text(json.dumps({"ignore_paths": bad_ign}), encoding="utf-8")
+            esc = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj)])
+            self.assertEqual(esc.returncode, 1, f"应拦截危险 ignore_paths={bad_ign}")
+
+        # 写入合法声明式规则（ignore_paths + 单一事实源 public_entries + layer_bans + pattern_bans）
+        rules_payload = {
+            "ignore_paths": ["**/migrations/**", "src/generated/**", "deploy/assistant/**"],
+            "public_entries": {
+                "src/orders": "service.py",
+            },
+            "layer_bans": [
+                {
+                    "id": "domain-no-io",
+                    "from": ["src/domain/**"],
+                    "forbid_imports": ["src/infra/**", "httpx", "axios"],
+                    "message": "纯计算核禁引 infra 或外部网络库",
+                }
+            ],
+            "pattern_bans": [
+                {
+                    "id": "no-raw-use-effect",
+                    "paths": ["src/**/*.{ts,tsx}"],
+                    "allow_in": ["src/framework/**"],
+                    "regex": r"\buseEffect\s*\(",
+                    "message": "业务代码禁用原生 useEffect，请走 src/framework 受控封装",
+                }
+            ],
+        }
+        (proj / ".harness-rules.json").write_text(json.dumps(rules_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        (proj / "src" / "infra" / "db.py").write_text("CONN = 1\n", encoding="utf-8")
+        (proj / "src" / "infra" / "api.ts").write_text("export const fetchData = () => 1;\n", encoding="utf-8")
+        (proj / "src" / "orders" / "service.py").write_text("def place():\n    return True\n", encoding="utf-8")
+        (proj / "src" / "orders" / "internal" / "repo.py").write_text("def save():\n    return True\n", encoding="utf-8")
+        # ignore_paths 应干净跳过只加不删迁移、自动生成客户端与非模块助手模板 AGENTS.md
+        (proj / "src" / "orders" / "migrations").mkdir(parents=True)
+        (proj / "src" / "orders" / "migrations" / "001.py").write_text("def downgrade():\n    raise NotImplementedError\n", encoding="utf-8")
+        (proj / "src" / "generated").mkdir(parents=True)
+        (proj / "src" / "generated" / "client.ts").write_text("// @ts-ignore\n// TODO: auto\n", encoding="utf-8")
+        (proj / "deploy" / "assistant").mkdir(parents=True)
+        (proj / "deploy" / "assistant" / "AGENTS.md").write_text("\n".join(f"- line {i}" for i in range(40)) + "\n", encoding="utf-8")
+
+        # 2) public_entries（无模块 AGENTS.md 同样生效）+ layer_bans（Python 相对导入/三方库 + JS 导入）+ pattern_bans（含注释跳过与 allow_in）
+        (proj / "src" / "domain" / "calc.py").write_text(
+            "import httpx\n"
+            "from ..infra import db\n"
+            "from ..orders.internal import repo\n"
+            "X = 1\n",
+            encoding="utf-8",
+        )
+        (proj / "src" / "domain" / "calc.ts").write_text(
+            "import axios from 'axios';\n"
+            "import { fetchData } from '../infra/api';\n"
+            "export const v = [axios, fetchData];\n",
+            encoding="utf-8",
+        )
+        (proj / "src" / "ui" / "App.tsx").write_text(
+            "// 注释里提及 useEffect( 不应误报\n"
+            "export function App() { useEffect(() => {}); return null; }\n",
+            encoding="utf-8",
+        )
+        (proj / "src" / "framework" / "hooks.ts").write_text(
+            "export function useSafeEffect(fn: () => void) { useEffect(fn); }\n",
+            encoding="utf-8",
+        )
+        rule_fail = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj)])
+        self.assertEqual(rule_fail.returncode, 1)
+        self.assertIn("src/domain/calc.py:1: [domain-no-io]", rule_fail.stderr)
+        self.assertIn("src/domain/calc.py:2: [domain-no-io]", rule_fail.stderr)
+        self.assertIn("src/domain/calc.py:3: 模块边界越权导入", rule_fail.stderr)
+        self.assertIn("src/domain/calc.ts:1: [domain-no-io]", rule_fail.stderr)
+        self.assertIn("src/domain/calc.ts:2: [domain-no-io]", rule_fail.stderr)
+        self.assertIn("src/ui/App.tsx:2: [no-raw-use-effect]", rule_fail.stderr)
+        self.assertNotIn("src/ui/App.tsx:1:", rule_fail.stderr)
+        self.assertNotIn("src/framework/hooks.ts", rule_fail.stderr)
+
+        # 裸 rule-ok(id) 无原因不能豁免；附原因 rule-ok(id: 原因) 放行并进入账本
+        (proj / "src" / "domain" / "calc.py").write_text(
+            "import httpx  # rule-ok(domain-no-io)\n", encoding="utf-8"
+        )
+        self.assertEqual(self.run_cmd(["python3", str(HARNESS_GUARD), str(proj)]).returncode, 1)
+        (proj / "src" / "domain" / "calc.py").write_text(
+            "import httpx  # rule-ok(domain-no-io: 迁移过渡)\n"
+            "from ..orders.service import place\n"
+            "X = (httpx, place)\n",
+            encoding="utf-8",
+        )
+        (proj / "src" / "domain" / "calc.ts").write_text("export const v = 1;\n", encoding="utf-8")
+        (proj / "src" / "ui" / "App.tsx").write_text(
+            "// rule-ok(no-raw-use-effect: 历史桥接)\n"
+            "export function App() { useEffect(() => {}); return null; }\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_cmd(["python3", str(HARNESS_GUARD), str(proj)]).returncode, 0)
+
+        # 3) 全仓裸消音拦截 vs 精确错误码/字符串字面量放行
+        (proj / "src" / "infra" / "silencers.py").write_text(
+            "S = '# type: ignore # noqa'\n"
+            "a = 1  # type: ignore\n"
+            "b = 2  # noqa\n"
+            "c = 3  # type: ignore[assignment]\n"
+            "d = 4  # noqa: E501\n"
+            "e = 5  # type: ignore  # ignore-ok(三方库缺桩)\n",
+            encoding="utf-8",
+        )
+        (proj / "src" / "ui" / "silencers.ts").write_text(
+            "export const lit = '@ts-ignore @ts-nocheck eslint-disable';\n"
+            "// @ts-nocheck\n"
+            "// @ts-ignore\n"
+            "// @ts-expect-error\n"
+            "// eslint-disable-next-line -- just ignore\n"
+            "// @ts-expect-error: legacy SDK missing field\n"
+            "// eslint-disable-next-line no-console\n"
+            "// @ts-ignore ignore-ok(历史兼容)\n",
+            encoding="utf-8",
+        )
+        sil_fail = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj)])
+        self.assertEqual(sil_fail.returncode, 1)
+        self.assertNotIn("silencers.py:1:", sil_fail.stderr)
+        self.assertIn("silencers.py:2:", sil_fail.stderr)
+        self.assertIn("silencers.py:3:", sil_fail.stderr)
+        self.assertNotIn("silencers.py:4:", sil_fail.stderr)
+        self.assertNotIn("silencers.py:5:", sil_fail.stderr)
+        self.assertNotIn("silencers.py:6:", sil_fail.stderr)
+        self.assertNotIn("silencers.ts:1:", sil_fail.stderr)
+        self.assertIn("silencers.ts:2:", sil_fail.stderr)
+        self.assertIn("silencers.ts:3:", sil_fail.stderr)
+        self.assertIn("silencers.ts:4:", sil_fail.stderr)
+        self.assertIn("silencers.ts:5:", sil_fail.stderr)
+        self.assertNotIn("silencers.ts:6:", sil_fail.stderr)
+        self.assertNotIn("silencers.ts:7:", sil_fail.stderr)
+        self.assertNotIn("silencers.ts:8:", sil_fail.stderr)
+
+        (proj / "src" / "infra" / "silencers.py").unlink()
+        (proj / "src" / "ui" / "silencers.ts").unlink()
+
+        # 4) 过期 stub-ok(slice-01) 在 ws check 与 ws learn check 中均硬拦；未结项 slice-02 放行
+        (proj / "design" / "slices" / "01-foundation.md").write_text("# S1\n- **状态**：`verified`\n", encoding="utf-8")
+        (proj / "design" / "slices" / "02-next.md").write_text("# S2\n- **状态**：`building`\n", encoding="utf-8")
+        (proj / "src" / "infra" / "db.py").write_text(
+            "# TODO: active work stub-ok(slice-02)\n"
+            "# TODO: forgotten debt stub-ok(slice-01)\n"
+            "CONN = 1\n",
+            encoding="utf-8",
+        )
+        stale_chk = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj)])
+        self.assertEqual(stale_chk.returncode, 1)
+        self.assertIn("过期占位债", stale_chk.stderr)
+        self.assertNotIn("slice-02", stale_chk.stderr)
+
+        learn_fail = self.run_cmd(["python3", str(WS_BIN), "learn", "check", str(proj)])
+        self.assertNotEqual(learn_fail.returncode, 0)
+        self.assertIn("过期占位债", learn_fail.stderr)
+        self.assertIn(".harness-rules.json: 忽略 3 / 公开入口 1 / 分层禁令 1 / 禁式规则 1", learn_fail.stdout)
+        self.assertIn("豁免债", learn_fail.stdout)
+
+        # 清理过期占位后全绿，验证修改 .harness-rules.json 自动令 --full-covered 凭证失效
+        (proj / "src" / "infra" / "db.py").write_text("# TODO: active work stub-ok(slice-02)\nCONN = 1\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=proj)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: clean gardener baseline"], cwd=proj).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--record-full"]).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--full-covered"]).returncode, 0)
+
+        rules_payload["pattern_bans"].append({
+            "id": "no-eval",
+            "paths": ["src/**/*.py"],
+            "regex": r"\beval\s*\(",
+            "message": "禁 eval",
+        })
+        (proj / ".harness-rules.json").write_text(json.dumps(rules_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.assertNotEqual(self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--full-covered"]).returncode, 0)
+        self.run_cmd(["git", "add", ".harness-rules.json"], cwd=proj)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "chore: tighten rules"], cwd=proj).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "mode", "design", str(proj)]).returncode, 0)
+        self.run_cmd(["git", "add", "AGENTS.md"], cwd=proj)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "chore: lock design"], cwd=proj).returncode, 0)
+
+        # 5) 信任阶梯快车道（--lane fast）：禁止绕过未拍板同名切片；正常快车道可完整闭环
+        (proj / "design" / "slices" / "03-risky.md").write_text("# S3\n- **状态**：`proposed`\n", encoding="utf-8")
+        bypass_fast = self.run_cmd(["python3", str(WS_BIN), "line", "new", "03-risky", str(proj), "--lane", "fast"])
+        self.assertNotEqual(bypass_fast.returncode, 0)
+        self.assertIn("未拍板", bypass_fast.stderr)
+        (proj / "design" / "slices" / "03-risky.md").unlink()
+
+        fast_new = self.run_cmd(["python3", str(WS_BIN), "line", "new", "fix-rules", str(proj), "--lane", "fast", "--scope", "src/infra"])
+        self.assertEqual(fast_new.returncode, 0, fast_new.stderr)
+        self.assertIn("快车道 fast", fast_new.stdout)
+        fast_ls = self.run_cmd(["python3", str(WS_BIN), "line", "list", str(proj)]).stdout
+        self.assertIn("lane=fast", fast_ls)
+
+        wt = self.tmp_path / "gardener-app-lines" / "fix-rules"
+        (wt / "src" / "infra" / "db.py").write_text("CONN = 2\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=wt)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "refactor: clean stub"], cwd=wt).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "sync"], cwd=wt).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "rm", "fix-rules", str(proj)]).returncode, 0)
 
 
 if __name__ == "__main__":

@@ -49,14 +49,46 @@
 
 ---
 
-## 3. `src/<module>/AGENTS.md`（模块源码就近契约，建议 ≤40 行 / 硬上限 45 非空行）
+## 3. `.harness-rules.json`（项目根声明式架构与反模式硬护栏，唯一事实源，由 `ws check` 自动执行）
+
+```json
+{
+  "ignore_paths": ["**/migrations/**", "frontend/src/core/api/generated/**"],
+  "public_entries": {
+    "src/orders": "index.ts",
+    "src/pricing": "service.py"
+  },
+  "layer_bans": [
+    {
+      "id": "domain-no-io",
+      "from": ["src/domain/**"],
+      "forbid_imports": ["src/infra/**", "httpx", "requests", "sqlalchemy"],
+      "message": "domain 纯计算核严禁依赖 infra 或外部 I/O 库"
+    }
+  ],
+  "pattern_bans": [
+    {
+      "id": "no-raw-use-effect",
+      "paths": ["src/**/*.{ts,tsx}"],
+      "allow_in": ["src/framework/**"],
+      "regex": "\\buseEffect\\s*\\(",
+      "message": "业务代码禁用原生 useEffect，请改用 src/framework 受控封装"
+    }
+  ]
+}
+```
+
+> 行内确需例外时标注 `rule-ok(<rule-id>: <具体原因>)`，所有豁免由 `ws learn status` 自动入账审计。
+
+---
+
+## 4. `src/<module>/AGENTS.md`（复杂核心模块极薄备忘，按需创建，建议 ≤20 行 / 硬上限 25 非空行）
 
 ```markdown
 # Module: <模块名>
 
-- **职责与禁区**：负责 ...；绝不负责 ...（归 `<其他模块>`）。
-- **唯一公开入口**：外部只准通过 `./index.ts`（或 `./service.py`）调用。
-- **核心不变量与踩坑记录（Invariants & Gotchas）**：
+- **职责与禁区**：负责 ...；绝不负责 ...（机械边界与公开入口统一维护于 `.harness-rules.json`）。
+- **核心业务不变量（静态规则拦不住的领域坑）**：
   1. <例如：所有下单数量与止损价必须经 `roundToLotAndTick()` 向下截断，严禁四舍五入>
   2. <例如：本模块只追加事件正本，禁止原地 UPDATE 历史成交记录>
 - **单模块验证命令**：`pnpm test src/<module>`
@@ -64,7 +96,7 @@
 
 ---
 
-## 4. `scripts/check` 与发布凭证（Slice 00 门禁参考模板）
+## 5. `scripts/check` 与发布凭证（Slice 00 门禁参考模板）
 
 ```sh
 #!/bin/sh
@@ -86,7 +118,7 @@ fi
 
 ---
 
-## 5. `.github/workflows/check.yml`（云端零容器节流底线模板，防 CI 配额双烧）
+## 6. `.github/workflows/check.yml`（云端零容器节流底线模板，防 CI 配额双烧）
 
 ```yaml
 # 重型全量集成测试留在本机跑并由 `ws check --record-full` / `--verify-full` 锁死发版；
