@@ -11,3 +11,4 @@
 | **F05** | [F05-data-growth-and-read-amplification.md](./F05-data-growth-and-read-amplification.md) | 引入数据湖/扩展自建表、分区分批历史回补、组装长文本/大表只读视图或优化前端首屏与缓存时 |
 | **F06** | [F06-controlled-plugin-sandbox.md](./F06-controlled-plugin-sandbox.md) | 实现受控自定义 Python 插件热加载、AST 纯度白名单、`sys.settrace` 步数预算或脚本干跑校验时 |
 | **F07** | [F07-test-suite-bloat-and-slow-gate.md](./F07-test-suite-bloat-and-slow-gate.md) | 编写/优化含数据库、数据湖或长窗口历史回补的测试套件，或设计 `scripts/check` 分层与全量门禁时 |
+| **F08** | [F08-blacklist-arms-race-and-review-loops.md](./F08-blacklist-arms-race-and-review-loops.md) | 实现安全拦截/命令策略解析，或零上下文对抗审查出现多轮未收敛与补丁膨胀时 |

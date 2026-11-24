@@ -1615,13 +1615,32 @@ class HarnessTestSuite(unittest.TestCase):
         gi = proj / ".gitignore"
         gi.write_text(gi.read_text(encoding="utf-8") + "repro/\n", encoding="utf-8")
 
-        # 占用空闲基准端口 base+1，验证 ws line new 自动跳过忙端口分配 slot=2
-        busy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        busy_sock.bind(("127.0.0.1", 0))
-        busy_sock.listen(1)
+        # 从避开系统临时端口段（Linux 32768+ / macOS 49152+）的区间挑选连续两个空闲端口，
+        # 占用 base+1 并确认 base+2 空闲，防止 connect_ex 探活分配的临时源端口撞上 base+2 进入 TIME_WAIT
+        busy_sock = None
+        base_port = None
+        for candidate in range(21000, 31000):
+            s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe2:
+                    probe2.settimeout(0.05)
+                    if probe2.connect_ex(("127.0.0.1", candidate + 2)) == 0:
+                        s1.close()
+                        s2.close()
+                        continue
+                s1.bind(("127.0.0.1", candidate + 1))
+                s2.bind(("127.0.0.1", candidate + 2))
+                s2.close()
+                s1.listen(1)
+                busy_sock = s1
+                base_port = candidate
+                break
+            except OSError:
+                s1.close()
+                s2.close()
+        self.assertIsNotNone(busy_sock, "未在非临时端口区间找到连续两个空闲测试端口")
         try:
-            busy_port = busy_sock.getsockname()[1]
-            base_port = busy_port - 1
             (proj / "deploy" / "compose.yaml").write_text(
                 f'services:\n  web:\n    ports:\n      - "127.0.0.1:${{WEB_PORT:-{base_port}}}:5175"\n',
                 encoding="utf-8",
