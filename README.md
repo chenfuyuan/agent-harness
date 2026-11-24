@@ -105,7 +105,7 @@ python3 tests/test_harness.py
 | [`explore-architect`](./harness/skills/explore-architect/SKILL.md) | `design` | L1–L3 复杂度分流、两段式探索（先问题空间揭示领域硬律、禁抢推方案 → 后第一性原理构想与标杆照妖镜）、生成 `design/SYSTEM.md` |
 | [`bespoke-prototype`](./harness/skills/bespoke-prototype/SKILL.md) | `design` | 从项目真实需求原生推导页面结构（标杆与 Seed 只作参考不照抄）、审美三旋钮、主屏比稿、生成 `DESIGN.md` + `tokens.css` + 零构建原型 |
 | [`tech-architect`](./harness/skills/tech-architect/SKILL.md) | `design` | 从真实体量与领域硬律第一性原理推导架构、以开源标杆作压力测试与局部采珠、生成可执行 `design/TECH.md` |
-| [`slice-build`](./harness/skills/slice-build/SKILL.md) | `build` | 切片级技术方案设计（联动 `playbooks/` 防坑）、子代理隔离真数据探针、模块就近 `AGENTS.md`、算账 TDD 与务实 UI 还原 |
+| [`slice-build`](./harness/skills/slice-build/SKILL.md) | `build` | 切片级技术方案设计（联动 `playbooks/` 防坑）、子代理隔离真数据探针、模块就近 `AGENTS.md`、核心计算 TDD 与务实 UI 还原 |
 | [`systematic-debugging`](./harness/skills/systematic-debugging/SKILL.md) | 排障治本 | 零改动 RED 取证、AI/竞态录带定格回放、违约归属与级联溯源、动手前「治本四校」防症状消音补丁 |
 | [`adversarial-review`](./harness/skills/adversarial-review/SKILL.md) | 跨关卡 | 开工前工程师挑刺（Builder Check）+ 交付前零上下文 Diff 审计 + 故障修复治本审查（Cure Audit） |
 | [`compound-learn`](./harness/skills/compound-learn/SKILL.md) | 自进化 | 三级经验飞轮（模块 `AGENTS.md` → 母仓 `playbooks/` 错法卡 → 事不过二编译进代码守卫，毕业即删旧字） |
