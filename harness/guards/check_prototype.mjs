@@ -192,7 +192,21 @@ for (const entryHtml of htmlEntries) {
           }
         });
 
-        return { empty: textLen === 0 && visibleChildren === 0, overflow, nestedBorderCards };
+        // 务实防廉价感提醒 2：检测单屏静态状态胶囊/徽章泛滥（践行“正常即静默，异常才显色”）
+        let densePillBadges = 0;
+        root.querySelectorAll('[class*="badge"], [class*="pill"], [class*="tag"], [class*="chip"]').forEach((el) => {
+          if (el.tagName === 'BUTTON' || el.tagName === 'INPUT' || el.tagName === 'A') return;
+          const rects = el.getClientRects();
+          if (rects.length === 0) return;
+          const r = rects[0];
+          if (r.height > 32 || r.width > 200) return;
+          const bg = getComputedStyle(el).backgroundColor;
+          if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
+            densePillBadges += 1;
+          }
+        });
+
+        return { empty: textLen === 0 && visibleChildren === 0, overflow, nestedBorderCards, densePillBadges };
       });
 
       if (check.empty) {
@@ -203,6 +217,9 @@ for (const entryHtml of htmlEntries) {
       }
       if (check.nestedBorderCards > 2) {
         warnings.push(`[${tag}] 检测到 ${check.nestedBorderCards} 处带边框容器层层套框，建议改用背景色阶或细分割线降噪`);
+      }
+      if (check.densePillBadges > 12) {
+        warnings.push(`[${tag}] 检测到 ${check.densePillBadges} 个带底色状态胶囊，建议践行「正常即静默、异常才显色」去噪`);
       }
 
       if (shotsDir) {

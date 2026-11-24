@@ -650,6 +650,14 @@ class HarnessTestSuite(unittest.TestCase):
         self.assertIn("遍历 4 个视图×状态组合", chk.stdout)
         self.assertTrue((shots_dir / "variant-a__trade__normal.png").is_file())
 
+        # 单屏超过 12 个带底色静态状态胶囊时应输出去噪提醒（不阻断返回码 0）
+        noisy_html = self.tmp_path / "noisy-pills.html"
+        pills = "".join(f'<span class="tag" style="background:#e7f5ee;padding:2px 6px">ok-{i}</span>' for i in range(14))
+        noisy_html.write_text(f'<!doctype html><html><body><main id="app">{pills}</main></body></html>', encoding="utf-8")
+        noisy_chk = self.run_cmd(["node", str(PROTO_CHECKER), str(noisy_html)])
+        self.assertEqual(noisy_chk.returncode, 0, noisy_chk.stdout + noisy_chk.stderr)
+        self.assertIn("带底色状态胶囊", noisy_chk.stdout)
+
     def test_08_sandbox_promote_isolated(self):
         idea_dir = self.sandbox_dir / "alpha-radar"
         idea_dir.mkdir(parents=True)
