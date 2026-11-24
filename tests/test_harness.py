@@ -1912,6 +1912,25 @@ class HarnessTestSuite(unittest.TestCase):
         })
         (proj / ".harness-rules.json").write_text(json.dumps(rules_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self.assertNotEqual(self.run_cmd(["python3", str(WS_BIN), "check", str(proj), "--full-covered"]).returncode, 0)
+
+        # 验证 Python docstring 中解释禁式（含中文字符）不触发 pattern_bans 误报，但同行或后续真实调用仍被拦截
+        (proj / "src" / "infra" / "doc_safe.py").write_text(
+            '"""模块说明：切勿使用 eval( 执行不可信文本。"""\n\n\n'
+            "def safe_fn() -> int:\n"
+            '    """函数说明：不要调 eval( 否则有注入风险。"""\n'
+            "    return 1\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_cmd(["python3", str(HARNESS_GUARD), str(proj)]).returncode, 0)
+        (proj / "src" / "infra" / "doc_safe.py").write_text(
+            'def bad_inline() -> int: "中文 docstring 禁 eval("; return eval("1")\n',
+            encoding="utf-8",
+        )
+        inline_fail = self.run_cmd(["python3", str(HARNESS_GUARD), str(proj)])
+        self.assertEqual(inline_fail.returncode, 1)
+        self.assertIn("doc_safe.py:1: [no-eval]", inline_fail.stderr)
+        (proj / "src" / "infra" / "doc_safe.py").unlink()
+
         self.run_cmd(["git", "add", ".harness-rules.json"], cwd=proj)
         self.assertEqual(self.run_cmd(["git", "commit", "-m", "chore: tighten rules"], cwd=proj).returncode, 0)
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "mode", "design", str(proj)]).returncode, 0)
@@ -1932,9 +1951,17 @@ class HarnessTestSuite(unittest.TestCase):
         self.assertIn("lane=fast", fast_ls)
 
         wt = self.tmp_path / "gardener-app-lines" / "fix-rules"
+        (wt / ".gitignore").write_text(
+            ((wt / ".gitignore").read_text(encoding="utf-8") if (wt / ".gitignore").exists() else "")
+            + ".hypothesis/\n",
+            encoding="utf-8",
+        )
         (wt / "src" / "infra" / "db.py").write_text("CONN = 2\n", encoding="utf-8")
         self.run_cmd(["git", "add", "-A"], cwd=wt)
         self.assertEqual(self.run_cmd(["git", "commit", "-m", "refactor: clean stub"], cwd=wt).returncode, 0)
+        # 属性测试自动生成的 .hypothesis/ 缓存不得误拦 ws line distill 与 ws line rm
+        (wt / ".hypothesis" / "constants").mkdir(parents=True)
+        (wt / ".hypothesis" / "constants" / "deadbeef").write_text("cache\n", encoding="utf-8")
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt).returncode, 0)
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "sync"], cwd=wt).returncode, 0)
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "rm", "fix-rules", str(proj)]).returncode, 0)

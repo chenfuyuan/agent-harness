@@ -43,7 +43,7 @@ description: >-
 
 ### Step 2：沉淀项目专属 `design/DESIGN.md` 与 `tokens.css`
 - 用户选定主屏方向后，删除落选变体，按 [design-md-spec.md](./references/design-md-spec.md) 固化本项目的 **`design/DESIGN.md`** 与 **`design/prototype/tokens.css`**。
-- **跨阶段价值**：进入 `Mode: build` 时，正式前端直接 `import` 这份 `tokens.css`，后续 1→N 新增页面无需再画静态 HTML 原型，读 `DESIGN.md` 即可延续一致审美。
+- **跨阶段价值与终态复核门**：进入 `Mode: build` 时，正式前端直接 `import` 这份 `tokens.css`；常规局部延续可直接复用既有原型与 `DESIGN.md`。但 0→1 原型多按全功能终态绘制，当后续 UI 切片仅落早期部分能力、或架构新增核心状态维度/布局变化时，**不机械跳过原型**，开线前须先向用户确认是否微调更新 `design/prototype/` 预览满意后再编码。
 
 ### Step 3：展开本切片关联交互视图与零侵入状态胶囊
 - **技术护栏（保证双击 `file://` 秒开）**：使用本地 `tokens.css` + 普通 `<script src="...">`（不使用在 `file://` 下会触发浏览器 CORS 拦截的 `<script type="module">` 或本地 `fetch()`；不依赖断网即崩的外部 Tailwind CDN）。

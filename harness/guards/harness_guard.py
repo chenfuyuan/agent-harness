@@ -8,7 +8,7 @@
 1. 声明式架构与反模式规则（项目根可选 `.harness-rules.json`，语法或 schema 非法时 fail-closed 拦截）：
    - `public_entries`：模块唯一公开入口边界（与模块 `AGENTS.md` 声明兼容，规则文件优先）；
    - `layer_bans`：目录单向分层依赖禁令（Python AST 解析 + JS/TS 词法级导入解析）；
-   - `pattern_bans`：高危 API / 反模式一刀切封禁（支持 `paths` / `allow_in` 白名单目录，默认跳过纯注释行）。
+   - `pattern_bans`：高危 API / 反模式一刀切封禁（支持 `paths` / `allow_in` 白名单目录，默认跳过纯注释与 Python docstring）。
    所有声明式规则支持行内显式豁免 `rule-ok(<rule-id>: <具体原因>)`。
 2. 裸类型/Lint 消音拦截（全仓零容忍）：
    - Python：拦裸 `# type: ignore` / `# pyright: ignore`（缺 `[code]`）、裸 `# noqa` / `# ruff: noqa`（缺 `: CODE`）；
@@ -591,8 +591,13 @@ def strip_js_comments(content: str) -> tuple[str, list[tuple[int, int, str]]]:
     return "".join(out), comments
 
 
+def _byte_offset_to_char_idx(line_str: str, byte_off: int) -> int:
+    """将 Python AST 的 UTF-8 字节偏移转为当前行的字符下标，避免中文字符导致切片错位。"""
+    return len(line_str.encode("utf-8")[:byte_off].decode("utf-8", errors="ignore"))
+
+
 def strip_python_comments(content: str) -> tuple[str, list[tuple[int, str]]]:
-    """用 Python `tokenize` 提取真实注释并生成同换行位置去注释代码，零字符串误判。"""
+    """用 Python `tokenize` + `ast` 剥离真实注释与纯 docstring（保留普通字符串与精确行号），零字符串误判。"""
     lines = content.splitlines(keepends=True)
     masked = [list(ln) for ln in lines]
     comments: list[tuple[int, str]] = []
@@ -615,6 +620,33 @@ def strip_python_comments(content: str) -> tuple[str, list[tuple[int, str]]]:
             if stripped.startswith("#"):
                 comments.append((idx, stripped.rstrip("\r\n")))
                 masked[idx - 1] = ["\n"] if ln.endswith("\n") else []
+
+    # 剥离模块/类/函数级纯 docstring（不动普通代码字符串字面量，也不污染 comments 消音检查）
+    try:
+        tree = ast.parse(content)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not node.body:
+                continue
+            first = node.body[0]
+            if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str)):
+                continue
+            start_ln = first.lineno
+            end_ln = first.end_lineno or start_ln
+            for ln_no in range(start_ln, min(end_ln, len(masked)) + 1):
+                raw_ln = lines[ln_no - 1]
+                row = masked[ln_no - 1]
+                c0 = _byte_offset_to_char_idx(raw_ln, first.col_offset) if ln_no == start_ln else 0
+                if ln_no == end_ln and first.end_col_offset is not None:
+                    c1 = _byte_offset_to_char_idx(raw_ln, first.end_col_offset)
+                else:
+                    c1 = len(row)
+                for c_idx in range(max(0, c0), min(c1, len(row))):
+                    if row[c_idx] not in ("\r", "\n"):
+                        row[c_idx] = " "
+    except SyntaxError:
+        pass
     return "".join("".join(row) for row in masked), comments
 
 

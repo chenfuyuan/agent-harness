@@ -1017,6 +1017,7 @@ SAFE_IGNORED_CACHE_NAMES = {
     ".DS_Store",
     "__pycache__",
     ".pytest_cache",
+    ".hypothesis",
     ".ruff_cache",
     ".mypy_cache",
     "node_modules",
@@ -1029,6 +1030,7 @@ SAFE_IGNORED_CACHE_NAMES = {
     ".turbo",
     "coverage",
     ".coverage",
+    "htmlcov",
 }
 HARNESS_MANAGED_LOCAL_FILES = {
     ".agents/hooks.json",
