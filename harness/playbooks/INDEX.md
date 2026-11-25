@@ -12,3 +12,4 @@
 | **F06** | [F06-controlled-plugin-sandbox.md](./F06-controlled-plugin-sandbox.md) | 实现受控自定义 Python 插件热加载、AST 纯度白名单、`sys.settrace` 步数预算或脚本干跑校验时 |
 | **F07** | [F07-test-suite-bloat-and-slow-gate.md](./F07-test-suite-bloat-and-slow-gate.md) | 编写/优化含数据库、数据湖或长窗口历史回补的测试套件，或设计 `scripts/check` 分层与全量门禁时 |
 | **F08** | [F08-blacklist-arms-race-and-review-loops.md](./F08-blacklist-arms-race-and-review-loops.md) | 实现安全拦截/命令策略解析，或零上下文对抗审查出现多轮未收敛与补丁膨胀时 |
+| **F09** | [F09-parser-differential-and-ops-guardrails.md](./F09-parser-differential-and-ops-guardrails.md) | 编写部署发布脚本、容器编排、环境变量/连接串/路径边界校验或运维诊断 CLI 时 |
