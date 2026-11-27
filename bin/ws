@@ -2199,12 +2199,12 @@ def cmd_line_distill(args):
             "请先将有价值的复现收进正式测试、需保留的报告迁回主目录清理后，再运行 `ws line distill`。"
         )
 
-    _, learn_warnings, learn_errors = inspect_learning_budget(wt_path)
+    _, learn_warnings, learn_errors = inspect_learning_budget(wt_path, include_hub=False)
     for w in learn_warnings:
         print(f"  [提示] {w}")
     if learn_errors:
         detail = "\n".join(f"  - {err}" for err in learn_errors)
-        raise WsError(f"开发线 `{line_name}` 未通过三级经验飞轮容量或公私分离检查：\n{detail}")
+        raise WsError(f"开发线 `{line_name}` 未通过业务仓沉淀容量或护栏规则检查：\n{detail}")
 
     with acquire_line_lock(common_git_dir):
         entries = parse_worktree_entries(main_repo)
@@ -2224,7 +2224,7 @@ def cmd_line_distill(args):
         reg[line_name] = cur_meta
         write_lines_registry(common_git_dir, reg)
 
-    print(f"[{line_name}] 已完成验收收尾沉淀核验并锁定提交 `{head_sha[:8]}`。")
+    print(f"[{line_name}] 已完成本业务仓验收收尾沉淀核验并锁定提交 `{head_sha[:8]}`。")
     print(
         f"  - 下一步：运行 `ws line sync` 快进合入主分支，随后运行 `ws line rm {line_name}` 收线"
         "（会删除 `.git` 与预览容器并销毁工作树目录，建议在主仓终端执行，或在工作树会话作为最后一步免沙箱执行）。"
@@ -2720,47 +2720,49 @@ def find_module_agents_files(proj: Path) -> list[Path]:
     return sorted(found)
 
 
-def inspect_learning_budget(proj: Path | None) -> tuple[list[str], list[str], list[str]]:
-    """返回 (status_lines, warnings, errors)。"""
-    pb_dir = get_playbooks_dir()
-    status_lines: list[str] = ["=== 1. 母仓跨项目错法模式卡（Tier 2 Playbooks）水位 ==="]
+def inspect_learning_budget(proj: Path | None, *, include_hub: bool = True) -> tuple[list[str], list[str], list[str]]:
+    """返回 (status_lines, warnings, errors)。`include_hub=False` 时仅校验目标业务仓水位与护栏。"""
+    status_lines: list[str] = []
     warnings: list[str] = []
     errors: list[str] = []
 
-    idx_file = pb_dir / "INDEX.md"
-    if not idx_file.is_file():
-        errors.append(f"缺少错法模式卡索引文件：{idx_file}")
-        status_lines.append(f"  [ERR] 缺少 INDEX.md ({idx_file})")
-    else:
-        idx_txt = idx_file.read_text(encoding="utf-8", errors="replace")
-        idx_lines = count_nonempty_lines(idx_file)
-        cards = sorted(p for p in pb_dir.glob("*.md") if p.name != "INDEX.md")
-        idx_tag = "OK" if idx_lines <= PLAYBOOKS_INDEX_MAX_LINES else "OVER"
-        cnt_tag = "OK" if len(cards) <= PLAYBOOKS_MAX_CARDS else "OVER"
-        status_lines.append(f"  [{idx_tag}] INDEX.md: {idx_lines}/{PLAYBOOKS_INDEX_MAX_LINES} 非空行")
-        status_lines.append(f"  [{cnt_tag}] 错法卡数量: {len(cards)}/{PLAYBOOKS_MAX_CARDS} 张")
-        if idx_lines > PLAYBOOKS_INDEX_MAX_LINES:
-            errors.append(f"INDEX.md 非空行数超限（{idx_lines} > {PLAYBOOKS_INDEX_MAX_LINES}）")
-        if len(cards) > PLAYBOOKS_MAX_CARDS:
-            errors.append(
-                f"母仓错法卡数量超限（{len(cards)} > {PLAYBOOKS_MAX_CARDS}）：请合并同类卡，或将成熟错法毕业编译进 harness/guards/ 后退役旧卡"
-            )
-        if PRIVATE_HOME_PATH_RE.search(idx_txt):
-            errors.append("INDEX.md 含本机私有用户目录路径，违反母仓公私分离红线")
+    if include_hub:
+        pb_dir = get_playbooks_dir()
+        status_lines.append("=== 1. 母仓跨项目错法模式卡（Tier 2 Playbooks）水位 ===")
+        idx_file = pb_dir / "INDEX.md"
+        if not idx_file.is_file():
+            errors.append(f"缺少错法模式卡索引文件：{idx_file}")
+            status_lines.append(f"  [ERR] 缺少 INDEX.md ({idx_file})")
+        else:
+            idx_txt = idx_file.read_text(encoding="utf-8", errors="replace")
+            idx_lines = count_nonempty_lines(idx_file)
+            cards = sorted(p for p in pb_dir.glob("*.md") if p.name != "INDEX.md")
+            idx_tag = "OK" if idx_lines <= PLAYBOOKS_INDEX_MAX_LINES else "OVER"
+            cnt_tag = "OK" if len(cards) <= PLAYBOOKS_MAX_CARDS else "OVER"
+            status_lines.append(f"  [{idx_tag}] INDEX.md: {idx_lines}/{PLAYBOOKS_INDEX_MAX_LINES} 非空行")
+            status_lines.append(f"  [{cnt_tag}] 错法卡数量: {len(cards)}/{PLAYBOOKS_MAX_CARDS} 张")
+            if idx_lines > PLAYBOOKS_INDEX_MAX_LINES:
+                errors.append(f"INDEX.md 非空行数超限（{idx_lines} > {PLAYBOOKS_INDEX_MAX_LINES}）")
+            if len(cards) > PLAYBOOKS_MAX_CARDS:
+                errors.append(
+                    f"母仓错法卡数量超限（{len(cards)} > {PLAYBOOKS_MAX_CARDS}）：请合并同类卡，或将成熟错法毕业编译进 harness/guards/ 后退役旧卡"
+                )
+            if PRIVATE_HOME_PATH_RE.search(idx_txt):
+                errors.append("INDEX.md 含本机私有用户目录路径，违反母仓公私分离红线")
 
-        for card in cards:
-            c_txt = card.read_text(encoding="utf-8", errors="replace")
-            c_lines = count_nonempty_lines(card)
-            in_index = card.name in idx_txt
-            c_tag = "OK" if (c_lines <= PLAYBOOK_CARD_MAX_LINES and in_index) else "ERR"
-            note = "" if in_index else "（未登记在 INDEX.md）"
-            status_lines.append(f"    - [{c_tag}] {card.name}: {c_lines}/{PLAYBOOK_CARD_MAX_LINES} 非空行{note}")
-            if c_lines > PLAYBOOK_CARD_MAX_LINES:
-                errors.append(f"错法卡 {card.name} 非空行数超限（{c_lines} > {PLAYBOOK_CARD_MAX_LINES}）")
-            if not in_index:
-                errors.append(f"错法卡 {card.name} 未登记在 INDEX.md 路由表中")
-            if PRIVATE_HOME_PATH_RE.search(c_txt):
-                errors.append(f"错法卡 {card.name} 含本机私有用户目录路径，违反母仓公私分离红线")
+            for card in cards:
+                c_txt = card.read_text(encoding="utf-8", errors="replace")
+                c_lines = count_nonempty_lines(card)
+                in_index = card.name in idx_txt
+                c_tag = "OK" if (c_lines <= PLAYBOOK_CARD_MAX_LINES and in_index) else "ERR"
+                note = "" if in_index else "（未登记在 INDEX.md）"
+                status_lines.append(f"    - [{c_tag}] {card.name}: {c_lines}/{PLAYBOOK_CARD_MAX_LINES} 非空行{note}")
+                if c_lines > PLAYBOOK_CARD_MAX_LINES:
+                    errors.append(f"错法卡 {card.name} 非空行数超限（{c_lines} > {PLAYBOOK_CARD_MAX_LINES}）")
+                if not in_index:
+                    errors.append(f"错法卡 {card.name} 未登记在 INDEX.md 路由表中")
+                if PRIVATE_HOME_PATH_RE.search(c_txt):
+                    errors.append(f"错法卡 {card.name} 含本机私有用户目录路径，违反母仓公私分离红线")
 
     if proj is not None and proj.is_dir() and proj != HUB_ROOT:
         audit_res = subprocess.run(

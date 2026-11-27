@@ -2254,6 +2254,50 @@ class HarnessTestSuite(unittest.TestCase):
         self.assertEqual(rm_nodm.returncode, 0, rm_nodm.stderr)
         self.assertFalse(wt_nodm.exists())
 
+    def test_25_ws_line_distill_scoped_to_project_independent_of_hub_playbooks(self):
+        proj = self.tmp_path / "distill-scope-app"
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "init", str(proj), "--mode", "build"]).returncode, 0)
+        (proj / "src" / "core").mkdir(parents=True)
+        (proj / "design" / "slices").mkdir(parents=True, exist_ok=True)
+        (proj / "design" / "slices" / "01-base.md").write_text("# S1\n- **状态**：`verified`\n", encoding="utf-8")
+        (proj / "src" / "core" / "calc.py").write_text("V = 1\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=proj)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: init"], cwd=proj).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "mode", "design", str(proj)]).returncode, 0)
+        self.run_cmd(["git", "add", "AGENTS.md"], cwd=proj)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "chore: lock design"], cwd=proj).returncode, 0)
+
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "new", "biz-distill", str(proj)]).returncode, 0)
+        wt = self.tmp_path / "distill-scope-app-lines" / "biz-distill"
+
+        # 1) 构造损坏的母仓 playbooks 目录（缺 INDEX.md）：ws learn check 必须拦截母仓，但业务线 ws line distill 不应被母仓阻塞
+        broken_pb = self.tmp_path / "broken-playbooks"
+        broken_pb.mkdir()
+        broken_env = {"WS_PLAYBOOKS_DIR": str(broken_pb)}
+        hub_chk = self.run_cmd(["python3", str(WS_BIN), "learn", "check"], cwd=HUB, env_override=broken_env)
+        self.assertNotEqual(hub_chk.returncode, 0)
+        self.assertIn("INDEX.md", hub_chk.stderr)
+
+        (wt / "src" / "core" / "calc.py").write_text("V = 2\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=wt)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: v2"], cwd=wt).returncode, 0)
+        biz_dist_ok = self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt, env_override=broken_env)
+        self.assertEqual(biz_dist_ok.returncode, 0, biz_dist_ok.stderr)
+        self.assertIn("本业务仓", biz_dist_ok.stdout)
+
+        # 2) 业务仓自身若存在过期 stub-ok 占位债，ws line distill 依然硬拦截
+        (wt / "src" / "core" / "calc.py").write_text("# TODO: stale stub-ok(slice-01)\nV = 3\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=wt)
+        self.assertEqual(self.run_cmd(["git", "commit", "--no-verify", "-m", "wip: stale stub"], cwd=wt).returncode, 0)
+        biz_dist_fail = self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt, env_override=broken_env)
+        self.assertNotEqual(biz_dist_fail.returncode, 0)
+        self.assertIn("过期占位债", biz_dist_fail.stderr)
+
+        # 3) 验收模板明确拆出「本业务仓沉淀」与「母仓 agent-harness 通用候选」两栏
+        tpl_txt = (HUB / "harness" / "templates" / "acceptance-report.html").read_text(encoding="utf-8")
+        self.assertIn("本业务仓沉淀", tpl_txt)
+        self.assertIn("母仓 agent-harness 通用候选", tpl_txt)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
