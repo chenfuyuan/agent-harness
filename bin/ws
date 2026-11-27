@@ -1175,7 +1175,7 @@ def git_branch_exists(repo: Path, branch: str) -> bool:
     return res.returncode == 0
 
 
-def read_lines_registry(common_git_dir: Path, main_repo: Path, entries: list[dict]) -> dict[str, dict]:
+def read_raw_lines_registry(common_git_dir: Path) -> dict[str, dict]:
     state_path = common_git_dir / LINES_STATE_FILE
     if not state_path.is_file():
         return {}
@@ -1186,11 +1186,20 @@ def read_lines_registry(common_git_dir: Path, main_repo: Path, entries: list[dic
     raw_lines = data.get("lines") if isinstance(data, dict) else None
     if not isinstance(raw_lines, dict):
         return {}
+    return {
+        name: meta
+        for name, meta in raw_lines.items()
+        if isinstance(name, str) and isinstance(meta, dict)
+    }
+
+
+def read_lines_registry(common_git_dir: Path, main_repo: Path, entries: list[dict]) -> dict[str, dict]:
+    raw_lines = read_raw_lines_registry(common_git_dir)
+    if not raw_lines:
+        return {}
     wt_paths = {str(e["path"]) for e in entries[1:]}
     cleaned: dict[str, dict] = {}
     for name, meta in raw_lines.items():
-        if not isinstance(name, str) or not isinstance(meta, dict):
-            continue
         branch = str(meta.get("branch") or f"line/{name}")
         path_str = str(meta.get("path") or "")
         if path_str in wt_paths or git_branch_exists(main_repo, branch):
@@ -1511,8 +1520,105 @@ def is_line_distilled(main_repo: Path, wt_path: Path | None, branch_name: str, m
     return True
 
 
-def cleanup_line_preview_containers(repo_name: str, line_name: str) -> bool:
+DOCKER_PERM_ERR_MARKERS = ("permission denied", "operation not permitted")
+ORPHAN_WT_ALLOWED_FILES = {".git", "CLAUDE.md", "AGENTS.md"}
+ORPHAN_WT_ALLOWED_DIRS = {".agents", ".claude"}
+
+
+def preflight_line_rm_writable(main_repo: Path, wt_path: Path, canonical_name: str):
+    """零损伤事前预检：在 POSIX 非 root 环境下检测沙箱是否拦截对工作树或其 .git 的写删权限。"""
+    if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() == 0:
+        return
+    targets = [wt_path / ".git", wt_path]
+    if wt_path.parent != wt_path and wt_path.parent.name == f"{main_repo.name}-lines":
+        targets.append(wt_path.parent)
+    for target in targets:
+        if not target.exists():
+            continue
+        try:
+            st = target.stat()
+        except OSError:
+            continue
+        if (st.st_mode & 0o200) and not os.access(target, os.W_OK):
+            raise WsError(
+                f"沙箱禁止删除工作树 `.git`，请在主仓终端或免沙箱重跑 `ws line rm {canonical_name}`"
+                f"（受保护路径：{target}）。"
+            )
+
+
+def inspect_orphan_worktree(
+    main_repo: Path,
+    common_git_dir: Path,
+    canonical_name: str,
+    wt_path: Path,
+    raw_reg: dict[str, dict],
+) -> tuple[bool, list[str]]:
+    """核验不在 git worktree list 中的残留目录是否符合半删孤儿工作树安全自愈条件。"""
+    if canonical_name not in raw_reg or not LINE_NAME_RE.match(canonical_name):
+        return False, []
+    lines_dir = main_repo.parent / f"{main_repo.name}-lines"
+    expected_raw = lines_dir / canonical_name
+    if lines_dir.is_symlink() or expected_raw.is_symlink():
+        return False, []
+    if not wt_path.is_dir() or wt_path.is_symlink():
+        return False, []
+    if wt_path.resolve() != expected_raw.resolve():
+        return False, []
+
+    dot_git = wt_path / ".git"
+    if not dot_git.is_file() or dot_git.is_symlink():
+        return False, []
+    try:
+        git_lines = dot_git.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False, []
+    if not git_lines:
+        return False, []
+    first = git_lines[0].strip()
+    if not first.lower().startswith("gitdir:"):
+        return False, []
+    raw_gitdir = first.split(":", 1)[1].strip()
+    if not raw_gitdir:
+        return False, []
+    gitdir_path = Path(raw_gitdir)
+    if not gitdir_path.is_absolute():
+        gitdir_path = wt_path / gitdir_path
+    resolved_gitdir = gitdir_path.resolve()
+    worktrees_root = (common_git_dir / "worktrees").resolve()
+    if resolved_gitdir == worktrees_root or worktrees_root not in resolved_gitdir.parents:
+        return False, []
+    if resolved_gitdir.exists():
+        return False, []
+
+    unexpected: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(wt_path, followlinks=False):
+        cur = Path(dirpath)
+        kept_dirs: list[str] = []
+        for d in dirnames:
+            d_path = cur / d
+            d_rel = d_path.relative_to(wt_path)
+            if len(d_rel.parts) == 1 and d in ORPHAN_WT_ALLOWED_DIRS:
+                continue
+            if d_path.is_symlink():
+                unexpected.append(d_rel.as_posix())
+                continue
+            kept_dirs.append(d)
+        dirnames[:] = kept_dirs
+
+        for f in filenames:
+            f_path = cur / f
+            f_rel = f_path.relative_to(wt_path)
+            if len(f_rel.parts) == 1 and f in ORPHAN_WT_ALLOWED_FILES:
+                continue
+            unexpected.append(f_rel.as_posix())
+
+    return True, sorted(set(unexpected))
+
+
+def cleanup_line_preview_containers(repo_name: str, line_name: str, *, skip_docker: bool = False) -> bool:
     """按 ws.repo + ws.line 双标签精准清理该开发线的预览容器、数据卷、网络与本地开发镜像。"""
+    if skip_docker:
+        return False
     docker_bin = shutil.which("docker")
     if not docker_bin:
         return False
@@ -1525,9 +1631,23 @@ def cleanup_line_preview_containers(repo_name: str, line_name: str) -> bool:
             text=True,
             timeout=8,
         )
+    except PermissionError as exc:
+        raise WsError(
+            f"无权限访问 Docker 以清理开发线 `{line_name}` 的预览容器（{exc}）。\n"
+            f"为避免漏删预览容器，请切出沙箱或在主仓终端重跑 `ws line rm {line_name}`；"
+            f"若确认本线无预览容器需清理，可显式追加 `--skip-docker`。"
+        )
     except (OSError, subprocess.SubprocessError):
         return False
     if ps_res.returncode != 0:
+        err_text = (ps_res.stderr or "").strip()
+        err_lower = err_text.lower()
+        if any(marker in err_lower for marker in DOCKER_PERM_ERR_MARKERS):
+            raise WsError(
+                f"无权限访问 Docker 守护进程以清理开发线 `{line_name}` 的预览容器（{err_text}）。\n"
+                f"为避免漏删预览容器，请切出沙箱或在主仓终端重跑 `ws line rm {line_name}`；"
+                f"若确认本线无预览容器需清理，可显式追加 `--skip-docker`。"
+            )
         return False
 
     cleaned = False
@@ -2105,7 +2225,10 @@ def cmd_line_distill(args):
         write_lines_registry(common_git_dir, reg)
 
     print(f"[{line_name}] 已完成验收收尾沉淀核验并锁定提交 `{head_sha[:8]}`。")
-    print(f"  - 下一步：运行 `ws line sync` 快进合入主分支，随后在主目录运行 `ws line rm {line_name}` 收线。")
+    print(
+        f"  - 下一步：运行 `ws line sync` 快进合入主分支，随后运行 `ws line rm {line_name}` 收线"
+        "（会删除 `.git` 与预览容器并销毁工作树目录，建议在主仓终端执行，或在工作树会话作为最后一步免沙箱执行）。"
+    )
     return 0
 
 
@@ -2263,7 +2386,10 @@ def cmd_line_sync(args):
             write_lines_registry(common_git_dir, reg)
 
         print(f"[{line_name}] 已通过门禁与沉淀核验，快进合入 `{base_branch}`（共 {ahead} 个提交）。")
-        print(f"  - 若本开发线已交付完结，可在主目录运行 `ws line rm {line_name}` 收线清理。")
+        print(
+            f"  - 若本开发线已交付完结，请运行 `ws line rm {line_name}` 收线清理"
+            "（会删除 `.git` 与预览容器并销毁工作树目录，建议在主仓终端执行，或在工作树会话作为最后一步免沙箱执行）。"
+        )
     return 0
 
 
@@ -2274,10 +2400,11 @@ def cmd_line_rm(args):
 
     with acquire_line_lock(common_git_dir):
         entries = parse_worktree_entries(main_repo)
+        raw_reg = read_raw_lines_registry(common_git_dir)
         reg = read_lines_registry(common_git_dir, main_repo, entries)
 
         canonical_name = raw_name[len("line/"):] if raw_name.startswith("line/") else raw_name
-        meta = reg.get(canonical_name, {})
+        meta = reg.get(canonical_name) or raw_reg.get(canonical_name) or {}
         branch_name = str(meta.get("branch") or f"line/{canonical_name}")
         wt_path: Path | None = None
         wt_entry: dict | None = None
@@ -2294,7 +2421,10 @@ def cmd_line_rm(args):
                     branch_name = str(meta["branch"])
                 break
         if wt_path is None and meta.get("path"):
-            cand_wt = Path(str(meta["path"])).resolve()
+            cand_raw = Path(str(meta["path"]))
+            if cand_raw.is_symlink():
+                raise WsError(f"目录 {cand_raw} 为软链接且不在当前仓库的 Git 工作树列表中，为防误删已中止。")
+            cand_wt = cand_raw.resolve()
             if cand_wt != main_repo and cand_wt.exists():
                 wt_path = cand_wt
 
@@ -2304,7 +2434,7 @@ def cmd_line_rm(args):
             raise WsError(f"禁止通过 `ws line rm` 删除主分支或保留分支 `{branch_short}`。")
 
         has_branch = git_branch_exists(main_repo, branch_name)
-        if wt_path is None and not has_branch and canonical_name not in reg:
+        if wt_path is None and not has_branch and canonical_name not in reg and canonical_name not in raw_reg:
             raise WsError(f"未找到开发线 `{raw_name}`（可运行 `ws line list` 核对名称）。")
         if wt_path == main_repo:
             raise WsError("禁止对主仓库执行 `ws line rm`。")
@@ -2314,25 +2444,38 @@ def cmd_line_rm(args):
             raise WsError(f"当前终端正位于待收掉的开发线目录 ({wt_path}) 内，请先切回主目录 ({main_repo}) 再执行 `ws line rm {canonical_name}`。")
 
         problems: list[str] = []
-        if wt_path and wt_path.is_dir():
+        is_orphan_wt = False
+        if wt_path and (wt_path.exists() or wt_path.is_symlink()):
             registered_wts = {e["path"] for e in entries[1:]}
             if wt_path not in registered_wts:
-                raise WsError(f"目录 {wt_path} 不在当前仓库的 Git 工作树列表中，为防误删已中止。")
-            in_prog = detect_in_progress_git_op(wt_path)
-            if in_prog:
-                problems.append(f"工作树正处于未完成的 Git 操作（{in_prog}，如变基冲突中断）")
-            st_res = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=str(wt_path),
-                capture_output=True,
-                text=True,
-            )
-            if st_res.returncode != 0 or st_res.stdout.strip():
-                problems.append(f"工作树存在未提交的改动（`git -C {wt_path} status`）")
-            precious = find_precious_ignored_files(wt_path)
-            if precious:
-                sample = ", ".join(precious[:6]) + (f" 等 {len(precious)} 项" if len(precious) > 6 else "")
-                problems.append(f"工作树内存在仅保存在本地的忽略文件（防误删）：{sample}")
+                is_orphan_wt, unexpected_files = inspect_orphan_worktree(
+                    main_repo, common_git_dir, canonical_name, wt_path, raw_reg
+                )
+                if not is_orphan_wt:
+                    raise WsError(f"目录 {wt_path} 不在当前仓库的 Git 工作树列表中，为防误删已中止。")
+                if unexpected_files:
+                    sample = ", ".join(unexpected_files[:8]) + (
+                        f" 等 {len(unexpected_files)} 项" if len(unexpected_files) > 8 else ""
+                    )
+                    problems.append(
+                        f"半删残留目录 {wt_path} 内仍存在非工作流托管文件（为防误删已中止）：{sample}"
+                    )
+            else:
+                in_prog = detect_in_progress_git_op(wt_path)
+                if in_prog:
+                    problems.append(f"工作树正处于未完成的 Git 操作（{in_prog}，如变基冲突中断）")
+                st_res = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(wt_path),
+                    capture_output=True,
+                    text=True,
+                )
+                if st_res.returncode != 0 or st_res.stdout.strip():
+                    problems.append(f"工作树存在未提交的改动（`git -C {wt_path} status`）")
+                precious = find_precious_ignored_files(wt_path)
+                if precious:
+                    sample = ", ".join(precious[:6]) + (f" 等 {len(precious)} 项" if len(precious) > 6 else "")
+                    problems.append(f"工作树内存在仅保存在本地的忽略文件（防误删）：{sample}")
 
         # 失败闭锁核查未合并提交：基线不存在或统计失败时，无 --discard 一律拒绝删除
         refs_to_verify: list[str] = []
@@ -2380,17 +2523,28 @@ def cmd_line_rm(args):
                 detail = "\n".join(f"  - {p}" for p in merged_undistilled)
                 raise WsError(f"拒绝收掉已合入主分支但未完成沉淀的开发线 `{canonical_name}`：\n{detail}")
 
-        cleaned_preview = cleanup_line_preview_containers(main_repo.name, canonical_name)
+        if wt_path and wt_path.exists():
+            preflight_line_rm_writable(main_repo, wt_path, canonical_name)
+
+        cleaned_preview = cleanup_line_preview_containers(
+            main_repo.name, canonical_name, skip_docker=getattr(args, "skip_docker", False)
+        )
 
         if wt_path and wt_path.exists():
-            rm_res = subprocess.run(
-                ["git", "worktree", "remove", "--force", str(wt_path)],
-                cwd=str(main_repo),
-                capture_output=True,
-                text=True,
-            )
-            if rm_res.returncode != 0:
-                raise WsError(f"移除工作树失败：{rm_res.stderr.strip() or rm_res.stdout.strip()}")
+            if is_orphan_wt:
+                try:
+                    shutil.rmtree(wt_path)
+                except OSError as exc:
+                    raise WsError(f"清理半删残留目录 {wt_path} 失败：{exc}")
+            else:
+                rm_res = subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(wt_path)],
+                    cwd=str(main_repo),
+                    capture_output=True,
+                    text=True,
+                )
+                if rm_res.returncode != 0:
+                    raise WsError(f"移除工作树失败：{rm_res.stderr.strip() or rm_res.stdout.strip()}")
             lines_parent = wt_path.parent
             if lines_parent.name == f"{main_repo.name}-lines":
                 try:
@@ -2409,12 +2563,13 @@ def cmd_line_rm(args):
             )
             if del_br.returncode != 0:
                 raise WsError(f"删除分支 `{branch_name}` 失败：{del_br.stderr.strip() or del_br.stdout.strip()}")
-        if canonical_name in reg:
-            del reg[canonical_name]
+        if canonical_name in reg or canonical_name in raw_reg:
+            reg.pop(canonical_name, None)
             write_lines_registry(common_git_dir, reg)
 
     env_note = "、预览容器与数据卷" if cleaned_preview else ""
-    print(f"[{main_repo.name}] 已收掉开发线 `{canonical_name}`（工作树{env_note}与分支 `{branch_name}` 已清理完毕）。")
+    wt_note = "半删残留工作树" if is_orphan_wt else "工作树"
+    print(f"[{main_repo.name}] 已收掉开发线 `{canonical_name}`（{wt_note}{env_note}与分支 `{branch_name}` 已清理完毕）。")
     return 0
 
 
@@ -2893,6 +3048,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_line_rm.add_argument("name", help="要清理的开发线名称")
     p_line_rm.add_argument("project_dir", nargs="?", default="", help="项目路径（省略则默认当前目录）")
     p_line_rm.add_argument("--discard", action="store_true", help="确认丢弃未合并提交或仅存于该工作树的本地文件")
+    p_line_rm.add_argument(
+        "--skip-docker",
+        action="store_true",
+        help="跳过 Docker 预览容器/卷/网络清理（仅在确认本线无预览容器或沙箱无 Docker 权限时使用）",
+    )
     p_line_rm.set_defaults(func=cmd_line_rm)
 
     p_map = sub.add_parser("map", help="生成目录或文件的 AST 符号与章节行号骨架地图", allow_abbrev=False)

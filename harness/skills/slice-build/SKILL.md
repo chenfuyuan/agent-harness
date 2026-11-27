@@ -77,4 +77,4 @@ description: >-
 - 待用户明确回复「验收通过」后，严格按以下物理顺序闭环：
   1. **落盘沉淀与复盘**：在当前开发线按 `compound-learn` 写入经用户确认的经验条目（融合审查拦截项 + 真机验收反馈），回填 `slice-NN.md#4 真用复盘` 并将切片状态标为 `verified`（正式环境投入日常使用后升 `used`），清理临时复现脚手架并完成提交；
   2. **锁死沉淀凭证**：运行 `<Hub-Ref>/bin/ws line distill`（若项目自带 `scripts/line` 则用项目脚本），自动执行 `ws learn check` 并将当前分支 `HEAD` 记入 `distilled_head`；
-  3. **快进合入与收线**：运行 `<Hub-Ref>/bin/ws line sync`（硬门禁核验 `distilled_head == HEAD` 后变基过检快进合入 `main`），最后切回主目录运行 `<Hub-Ref>/bin/ws line rm <slug>`（自动销毁该线预览容器/网络/开发镜像并清理工作树）。
+  3. **快进合入与收线**：运行 `<Hub-Ref>/bin/ws line sync`（硬门禁核验 `distilled_head == HEAD` 后变基过检快进合入 `main`），最后运行 `<Hub-Ref>/bin/ws line rm <slug>` 收线（该命令会删除工作树 `.git`、销毁预览容器/网络/开发镜像并移除工作树目录，**建议在主仓终端执行，或在工作树会话作为最后一步免沙箱执行**；如确认本线无预览容器可按需追加 `--skip-docker`）。

@@ -4,13 +4,18 @@
 特点：通过 WS_REGISTRY_FILE 与 WS_SANDBOX_DIR 环境变量完全隔离在临时目录内运行，对母仓工作树零污染。
 """
 from __future__ import annotations
+import argparse
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HUB = Path(__file__).resolve().parent.parent
@@ -31,8 +36,20 @@ class HarnessTestSuite(unittest.TestCase):
         self.sandbox_dir.mkdir(parents=True, exist_ok=True)
         self.check_fb_dir = self.tmp_path / "check-fallback"
         self.check_fb_dir.mkdir(parents=True, exist_ok=True)
+        # 隔离宿主真实 Docker（默认模拟 daemon 未启动），防止沙箱下无关用例误撞宿主 docker.sock
+        self.stub_bin_dir = self.tmp_path / "stub-bin"
+        self.stub_bin_dir.mkdir(parents=True, exist_ok=True)
+        stub_docker = self.stub_bin_dir / "docker"
+        stub_docker.write_text(
+            "#!/bin/sh\n"
+            'echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        stub_docker.chmod(0o755)
         self.env = {
             **os.environ,
+            "PATH": f"{self.stub_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
             "WS_REGISTRY_FILE": str(self.reg_file),
             "WS_SANDBOX_DIR": str(self.sandbox_dir),
             "WS_CHECK_FALLBACK_DIR": str(self.check_fb_dir),
@@ -49,15 +66,31 @@ class HarnessTestSuite(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_cmd(self, cmd: list[str], cwd: Path | None = None, stdin_text: str | None = None):
+    def run_cmd(
+        self,
+        cmd: list[str],
+        cwd: Path | None = None,
+        stdin_text: str | None = None,
+        env_override: dict[str, str] | None = None,
+    ):
+        run_env = {**self.env, **env_override} if env_override else self.env
         return subprocess.run(
             cmd,
             cwd=str(cwd) if cwd else None,
             input=stdin_text,
             text=True,
             capture_output=True,
-            env=self.env,
+            env=run_env,
         )
+
+    @staticmethod
+    def load_ws_module():
+        loader = importlib.machinery.SourceFileLoader("ws_cli_under_test", str(WS_BIN))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        assert spec is not None
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
 
     def claude_hook(self, proj: Path, tool: str, tool_input: dict, event: str = "PreToolUse", tool_use_id: str = "") -> dict:
         """按 Claude Code 钩子协议调用 mode_guard，返回其 JSON 输出。"""
@@ -1965,6 +1998,261 @@ class HarnessTestSuite(unittest.TestCase):
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt).returncode, 0)
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "sync"], cwd=wt).returncode, 0)
         self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "rm", "fix-rules", str(proj)]).returncode, 0)
+
+    def test_22_ws_line_rm_preflight_blocks_sandbox_readonly_git_zero_damage(self):
+        proj = self.tmp_path / "preflight-app"
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "init", str(proj), "--mode", "build"]).returncode, 0)
+        (proj / "src").mkdir()
+        (proj / "src" / "app.py").write_text("VAL = 1\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=proj)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: init"], cwd=proj).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "mode", "design", str(proj)]).returncode, 0)
+        self.run_cmd(["git", "add", "AGENTS.md"], cwd=proj)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "chore: lock design"], cwd=proj).returncode, 0)
+
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "new", "feat-ro", str(proj)]).returncode, 0)
+        wt = self.tmp_path / "preflight-app-lines" / "feat-ro"
+        (wt / "src" / "app.py").write_text("VAL = 2\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=wt)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: update val"], cwd=wt).returncode, 0)
+
+        dist_res = self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt)
+        self.assertEqual(dist_res.returncode, 0, dist_res.stderr)
+        self.assertIn("免沙箱", dist_res.stdout)
+        sync_res = self.run_cmd(["python3", str(WS_BIN), "line", "sync"], cwd=wt)
+        self.assertEqual(sync_res.returncode, 0, sync_res.stderr)
+        self.assertIn("免沙箱", sync_res.stdout)
+
+        dot_git = (wt / ".git").resolve()
+        hooks_file = wt / ".agents" / "hooks.json"
+        wt_admin = proj / ".git" / "worktrees" / "feat-ro"
+        self.assertTrue(dot_git.is_file())
+        self.assertTrue(bool(dot_git.stat().st_mode & 0o200))
+        self.assertTrue(hooks_file.is_file())
+        self.assertTrue(wt_admin.is_dir())
+
+        # 伪造会落盘哨兵文件的 docker，确保预检拦截发生在调用 docker 清理之前
+        docker_called_marker = self.tmp_path / "docker-called"
+        spy_bin = self.tmp_path / "spy-bin"
+        spy_bin.mkdir()
+        spy_docker = spy_bin / "docker"
+        spy_docker.write_text(
+            f'#!/bin/sh\ntouch "{docker_called_marker}"\nexit 0\n',
+            encoding="utf-8",
+        )
+        spy_docker.chmod(0o755)
+        spy_env = {**self.env, "PATH": f"{spy_bin}{os.pathsep}{self.env['PATH']}"}
+
+        ws_mod = self.load_ws_module()
+        real_access = os.access
+        rm_args = argparse.Namespace(name="feat-ro", project_dir=str(proj), discard=False, skip_docker=False)
+
+        # 1) 模拟沙箱写保护：.git 属主写位存在但 os.access(..., W_OK) 为 False -> 零损伤阻断
+        def deny_dot_git_write(path, mode, *args, **kwargs):
+            if mode == os.W_OK and Path(path).resolve() == dot_git:
+                return False
+            return real_access(path, mode, *args, **kwargs)
+
+        with (
+            mock.patch.dict(os.environ, spy_env, clear=True),
+            mock.patch.object(os, "geteuid", return_value=1000, create=True),
+            mock.patch.object(os, "access", side_effect=deny_dot_git_write),
+        ):
+            with self.assertRaises(ws_mod.WsError) as ctx:
+                ws_mod.cmd_line_rm(rm_args)
+        self.assertIn("沙箱禁止删除工作树 `.git`", str(ctx.exception))
+        self.assertIn("ws line rm feat-ro", str(ctx.exception))
+        # 验证零文件损毁：.git、.agents/hooks.json、.git/worktrees/feat-ro、源码与分支全部完好，且未触碰 docker
+        self.assertFalse(docker_called_marker.exists())
+        self.assertTrue(dot_git.is_file())
+        self.assertTrue(hooks_file.is_file())
+        self.assertTrue(wt_admin.is_dir())
+        self.assertTrue((wt / "src" / "app.py").is_file())
+        self.assertEqual(self.run_cmd(["git", "show-ref", "--verify", "--quiet", "refs/heads/line/feat-ro"], cwd=proj).returncode, 0)
+        reg_after_block = json.loads((proj / ".git" / "ws-lines.json").read_text(encoding="utf-8"))
+        self.assertIn("feat-ro", reg_after_block.get("lines", {}))
+
+        # 2) 模拟沙箱写保护命中工作树目录本身 -> 同样零损伤阻断
+        wt_resolved = wt.resolve()
+
+        def deny_wt_dir_write(path, mode, *args, **kwargs):
+            if mode == os.W_OK and Path(path).resolve() == wt_resolved:
+                return False
+            return real_access(path, mode, *args, **kwargs)
+
+        with (
+            mock.patch.dict(os.environ, spy_env, clear=True),
+            mock.patch.object(os, "geteuid", return_value=1000, create=True),
+            mock.patch.object(os, "access", side_effect=deny_wt_dir_write),
+        ):
+            with self.assertRaises(ws_mod.WsError) as ctx_dir:
+                ws_mod.cmd_line_rm(rm_args)
+        self.assertIn("沙箱禁止删除工作树 `.git`", str(ctx_dir.exception))
+        self.assertFalse(docker_called_marker.exists())
+        self.assertTrue(wt_admin.is_dir())
+
+        # 3) 切出沙箱重跑 ws line rm 应一次成功
+        rm_ok = self.run_cmd(["python3", str(WS_BIN), "line", "rm", "feat-ro", str(proj)])
+        self.assertEqual(rm_ok.returncode, 0, rm_ok.stderr)
+        self.assertFalse(wt.exists())
+        self.assertFalse((self.tmp_path / "preflight-app-lines").exists())
+        self.assertNotEqual(self.run_cmd(["git", "show-ref", "--verify", "--quiet", "refs/heads/line/feat-ro"], cwd=proj).returncode, 0)
+
+    def test_23_ws_line_rm_orphan_directory_recovery_and_fail_closed(self):
+        proj = self.tmp_path / "orphan-app"
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "init", str(proj), "--mode", "build"]).returncode, 0)
+        (proj / "src").mkdir()
+        (proj / "src" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=proj)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: init"], cwd=proj).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "mode", "design", str(proj)]).returncode, 0)
+        self.run_cmd(["git", "add", "AGENTS.md"], cwd=proj)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "chore: lock design"], cwd=proj).returncode, 0)
+
+        # 1) 构造已合流并沉淀但 git worktree remove 半途失败留下的孤儿目录
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "new", "half-del", str(proj)]).returncode, 0)
+        wt = self.tmp_path / "orphan-app-lines" / "half-del"
+        (wt / "src" / "mod.py").write_text("X = 2\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=wt)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: mod"], cwd=wt).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "sync"], cwd=wt).returncode, 0)
+
+        # 模拟半删：移除 .git/worktrees/half-del 并删掉源码文件（留空目录与 .git/CLAUDE.md/AGENTS.md/.agents/.claude）
+        shutil.rmtree(proj / ".git" / "worktrees" / "half-del")
+        for child in list(wt.iterdir()):
+            if child.name in {".git", "CLAUDE.md", "AGENTS.md", ".agents", ".claude"}:
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        (wt / "src" / "empty-sub").mkdir(parents=True)
+
+        # 1a) 孤儿目录含未知文件时必须 fail-closed 拒删并列出路径
+        unknown_file = wt / "src" / "unsaved_note.txt"
+        unknown_file.write_text("do not lose me\n", encoding="utf-8")
+        rm_unknown = self.run_cmd(["python3", str(WS_BIN), "line", "rm", "half-del", str(proj)])
+        self.assertNotEqual(rm_unknown.returncode, 0)
+        self.assertIn("src/unsaved_note.txt", rm_unknown.stderr)
+        self.assertTrue(unknown_file.is_file())
+        self.assertEqual(self.run_cmd(["git", "show-ref", "--verify", "--quiet", "refs/heads/line/half-del"], cwd=proj).returncode, 0)
+
+        # 1b) 若 .git 指向非当前仓库 worktrees 目录，即使带 --discard 也必须 fail-closed 拒删
+        orig_dot_git = (wt / ".git").read_text(encoding="utf-8")
+        (wt / ".git").write_text("gitdir: /tmp/foreign-repo/.git/worktrees/half-del\n", encoding="utf-8")
+        rm_foreign = self.run_cmd(["python3", str(WS_BIN), "line", "rm", "half-del", str(proj), "--discard"])
+        self.assertNotEqual(rm_foreign.returncode, 0)
+        self.assertIn("不在当前仓库的 Git 工作树列表中", rm_foreign.stderr)
+        self.assertTrue(wt.is_dir())
+        (wt / ".git").write_text(orig_dot_git, encoding="utf-8")
+
+        # 1c) 移走未知文件后，孤儿目录满足全部自愈条件 -> 自动 rmtree + 删空 -lines + prune + 删分支 + 清 ws-lines.json
+        unknown_file.unlink()
+        rm_heal = self.run_cmd(["python3", str(WS_BIN), "line", "rm", "half-del", str(proj)])
+        self.assertEqual(rm_heal.returncode, 0, rm_heal.stderr)
+        self.assertFalse(wt.exists())
+        self.assertFalse((self.tmp_path / "orphan-app-lines").exists())
+        self.assertNotEqual(self.run_cmd(["git", "show-ref", "--verify", "--quiet", "refs/heads/line/half-del"], cwd=proj).returncode, 0)
+        reg_clean = json.loads((proj / ".git" / "ws-lines.json").read_text(encoding="utf-8"))
+        self.assertNotIn("half-del", reg_clean.get("lines", {}))
+        # 确认不会沿技能软链误伤母仓文件
+        self.assertTrue((HUB / "harness" / "skills" / "slice-build" / "SKILL.md").is_file())
+
+        # 2) 孤儿目录含额外文件但显式传入 --discard（且已合流沉淀）时允许自愈清理
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "new", "half-discard", str(proj)]).returncode, 0)
+        wt2 = self.tmp_path / "orphan-app-lines" / "half-discard"
+        (wt2 / "src" / "mod.py").write_text("X = 3\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=wt2)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: mod 3"], cwd=wt2).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt2).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "sync"], cwd=wt2).returncode, 0)
+        shutil.rmtree(proj / ".git" / "worktrees" / "half-discard")
+        (wt2 / "scratch.txt").write_text("discardable\n", encoding="utf-8")
+        self.assertNotEqual(self.run_cmd(["python3", str(WS_BIN), "line", "rm", "half-discard", str(proj)]).returncode, 0)
+        rm_disc = self.run_cmd(["python3", str(WS_BIN), "line", "rm", "half-discard", str(proj), "--discard"])
+        self.assertEqual(rm_disc.returncode, 0, rm_disc.stderr)
+        self.assertFalse(wt2.exists())
+        self.assertFalse((self.tmp_path / "orphan-app-lines").exists())
+
+    def test_24_ws_line_rm_docker_permission_gate_and_skip_docker(self):
+        proj = self.tmp_path / "docker-app"
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "init", str(proj), "--mode", "build"]).returncode, 0)
+        (proj / "src").mkdir()
+        (proj / "src" / "app.py").write_text("D = 1\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=proj)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: init"], cwd=proj).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "mode", "design", str(proj)]).returncode, 0)
+        self.run_cmd(["git", "add", "AGENTS.md"], cwd=proj)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "chore: lock design"], cwd=proj).returncode, 0)
+
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "new", "feat-dk", str(proj)]).returncode, 0)
+        wt = self.tmp_path / "docker-app-lines" / "feat-dk"
+        (wt / "src" / "app.py").write_text("D = 2\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=wt)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: d2"], cwd=wt).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "sync"], cwd=wt).returncode, 0)
+
+        # 1) docker ps stderr 出现 permission denied -> 删工作树前诚实阻断并保持零损毁
+        perm_bin = self.tmp_path / "docker-perm-denied"
+        perm_bin.mkdir()
+        (perm_bin / "docker").write_text(
+            "#!/bin/sh\n"
+            'echo "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock" >&2\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        (perm_bin / "docker").chmod(0o755)
+        perm_env = {"PATH": f"{perm_bin}{os.pathsep}{self.env['PATH']}"}
+
+        rm_denied = self.run_cmd(["python3", str(WS_BIN), "line", "rm", "feat-dk", str(proj)], env_override=perm_env)
+        self.assertNotEqual(rm_denied.returncode, 0)
+        self.assertIn("permission denied", rm_denied.stderr.lower())
+        self.assertIn("--skip-docker", rm_denied.stderr)
+        self.assertTrue(wt.is_dir())
+        self.assertTrue((wt / ".git").is_file())
+        self.assertTrue((wt / ".agents" / "hooks.json").is_file())
+        self.assertTrue((proj / ".git" / "worktrees" / "feat-dk").is_dir())
+
+        # 2) docker ps stderr 出现 operation not permitted -> 同样诚实阻断
+        eperm_bin = self.tmp_path / "docker-eperm"
+        eperm_bin.mkdir()
+        (eperm_bin / "docker").write_text(
+            "#!/bin/sh\n"
+            'echo "dial unix /var/run/docker.sock: connect: operation not permitted" >&2\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        (eperm_bin / "docker").chmod(0o755)
+        eperm_env = {"PATH": f"{eperm_bin}{os.pathsep}{self.env['PATH']}"}
+
+        rm_eperm = self.run_cmd(["python3", str(WS_BIN), "line", "rm", "feat-dk", str(proj)], env_override=eperm_env)
+        self.assertNotEqual(rm_eperm.returncode, 0)
+        self.assertIn("operation not permitted", rm_eperm.stderr.lower())
+        self.assertIn("--skip-docker", rm_eperm.stderr)
+        self.assertTrue(wt.is_dir())
+
+        # 3) 显式传入 --skip-docker 放行收线
+        rm_skip = self.run_cmd(
+            ["python3", str(WS_BIN), "line", "rm", "feat-dk", str(proj), "--skip-docker"],
+            env_override=perm_env,
+        )
+        self.assertEqual(rm_skip.returncode, 0, rm_skip.stderr)
+        self.assertFalse(wt.exists())
+        self.assertNotEqual(self.run_cmd(["git", "show-ref", "--verify", "--quiet", "refs/heads/line/feat-dk"], cwd=proj).returncode, 0)
+
+        # 4) daemon 未启动（默认 stub_bin_dir）仍保持静默跳过
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "new", "feat-nodm", str(proj)]).returncode, 0)
+        wt_nodm = self.tmp_path / "docker-app-lines" / "feat-nodm"
+        (wt_nodm / "src" / "app.py").write_text("D = 3\n", encoding="utf-8")
+        self.run_cmd(["git", "add", "-A"], cwd=wt_nodm)
+        self.assertEqual(self.run_cmd(["git", "commit", "-m", "feat: d3"], cwd=wt_nodm).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "distill"], cwd=wt_nodm).returncode, 0)
+        self.assertEqual(self.run_cmd(["python3", str(WS_BIN), "line", "sync"], cwd=wt_nodm).returncode, 0)
+        rm_nodm = self.run_cmd(["python3", str(WS_BIN), "line", "rm", "feat-nodm", str(proj)])
+        self.assertEqual(rm_nodm.returncode, 0, rm_nodm.stderr)
+        self.assertFalse(wt_nodm.exists())
 
 
 if __name__ == "__main__":
